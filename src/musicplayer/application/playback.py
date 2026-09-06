@@ -57,22 +57,29 @@ class PlaybackController:
         self.queue = PlaybackQueue.from_dict(persisted)
         original_items = list(self.queue.items)
         original_index = self.queue.current_index
-        available = [self.manager.has_track(item) for item in original_items]
-        self.queue.items = [
-            item
-            for item, is_available in zip(original_items, available)
-            if is_available
-        ]
-        current_was_available = (
-            0 <= original_index < len(available) and available[original_index]
-        )
+        
+        new_items = []
+        items_before_original = 0
+        current_was_available = False
+
+        for i, item in enumerate(original_items):
+            is_avail = self.manager.has_track(item)
+            if is_avail:
+                new_items.append(item)
+                if i < original_index:
+                    items_before_original += 1
+            if i == original_index:
+                current_was_available = is_avail
+
+        self.queue.items = new_items
+        
         if not self.queue.items:
             self.queue.current_index = -1
         elif current_was_available:
-            self.queue.current_index = sum(available[:original_index])
+            self.queue.current_index = items_before_original
         else:
             self.queue.current_index = min(
-                sum(available[: max(0, original_index)]), len(self.queue.items) - 1
+                items_before_original, len(self.queue.items) - 1
             )
         self.position_ms = (
             int(persisted.get("position_ms", 0)) if current_was_available else 0
@@ -102,12 +109,18 @@ class PlaybackController:
         return self.queue.current
 
     def play_tracks(self, track_ids: list[str], *, start_index: int = 0) -> None:
-        requested = [str(item) for item in track_ids]
+        requested = []
+        available = []
+        for item in track_ids:
+            item_str = str(item)
+            requested.append(item_str)
+            if self.manager.has_track(item_str):
+                available.append(item_str)
+        
         selected_index = (
             max(0, min(start_index, len(requested) - 1)) if requested else -1
         )
         selected = requested[selected_index] if selected_index >= 0 else None
-        available = [item for item in requested if self.manager.has_track(item)]
         if not available:
             self._error("There are no available tracks to play.")
             return

@@ -830,13 +830,13 @@ class MusicManager:
         """Add several existing tracks with one atomic metadata write."""
         with self._lock:
             playlist = self._get_playlist(playlist_id)
-            normalized = [self._get_track(track_id).id for track_id in track_ids]
             existing = set(playlist.track_ids)
             additions: list[UUID] = []
-            for track_id in normalized:
-                if track_id not in existing:
-                    additions.append(track_id)
-                    existing.add(track_id)
+            for track_id in track_ids:
+                normalized_id = self._get_track(track_id).id
+                if normalized_id not in existing:
+                    additions.append(normalized_id)
+                    existing.add(normalized_id)
             if not additions:
                 return 0
 

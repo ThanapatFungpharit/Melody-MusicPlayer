@@ -155,12 +155,12 @@ class DownloadCoordinator:
         for value in urls:
             source = str(value).strip()
             if source and source not in seen:
+                if not is_youtube_url(source):
+                    raise ValueError("Only YouTube URLs are supported.")
                 sources.append(source)
                 seen.add(source)
         if not sources:
             raise ValueError("At least one YouTube URL is required.")
-        if any(not is_youtube_url(source) for source in sources):
-            raise ValueError("Only YouTube URLs are supported.")
 
         batch_id = str(uuid4())
         batch_created_at = time.time()
