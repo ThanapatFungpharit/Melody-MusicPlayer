@@ -166,7 +166,9 @@ def _path_violation(path: str, development_packages: set[str]) -> str | None:
     filename = folded_parts[-1] if folded_parts else ""
 
     forbidden_directory = next(
-        (part for part in folded_parts[:-1] if part in _FORBIDDEN_DIRECTORY_NAMES),
+        (part for i, part in enumerate(folded_parts[:-1]) 
+         if part in _FORBIDDEN_DIRECTORY_NAMES
+         and not (part == "__pycache__" and "stdlib" in folded_parts[:i])),
         None,
     )
     if forbidden_directory:

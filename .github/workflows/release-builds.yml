@@ -30,6 +30,7 @@ jobs:
       PYTHONDEVMODE: "0"
       PYTHONASYNCIODEBUG: "0"
       PYTHONOPTIMIZE: "2"
+      PYTHONIOENCODING: "utf-8"
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
@@ -37,6 +38,9 @@ jobs:
           enable-cache: true
       - name: Install isolated release toolchain
         run: uv sync --frozen --no-dev --group build
+      - name: Install Linux build dependencies
+        if: matrix.target == 'linux'
+        run: sudo apt-get update && sudo apt-get install -y ninja-build pkg-config libgtk-3-dev
       - name: Build desktop bundle
         shell: bash
         run: >-
@@ -65,6 +69,7 @@ jobs:
       PYTHONDEVMODE: "0"
       PYTHONASYNCIODEBUG: "0"
       PYTHONOPTIMIZE: "2"
+      PYTHONIOENCODING: "utf-8"
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
