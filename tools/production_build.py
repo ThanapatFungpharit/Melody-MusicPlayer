@@ -160,9 +160,7 @@ def production_process_environment() -> Iterator[None]:
     """Temporarily apply the production environment to an in-process build."""
     safe_environment = production_build_environment()
     previous = {name: os.environ.get(name) for name in _PRODUCTION_VALUES}
-    os.environ.update(
-        {name: safe_environment[name] for name in _PRODUCTION_VALUES}
-    )
+    os.environ.update({name: safe_environment[name] for name in _PRODUCTION_VALUES})
     try:
         yield
     finally:

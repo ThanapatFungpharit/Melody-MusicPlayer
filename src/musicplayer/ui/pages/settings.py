@@ -15,7 +15,7 @@ from musicplayer.application.cookie_files import (
 from musicplayer.application.models import AppSettings
 from musicplayer.application.providers import ProviderRegistry
 from musicplayer.ui.components.common import _theme_mode
-from musicplayer.ui.theme import THEME_PALETTES, accent_color, card
+from musicplayer.ui.theme import THEME_PALETTES, card
 
 if TYPE_CHECKING:
     from musicplayer.ui._app_protocol import AppProtocol
@@ -446,8 +446,7 @@ class SettingsPage(_Base):
         return result
 
     def _confirm_data_action(self, action: str) -> None:
-        track_count = len(self.manager.list_tracks())
-        playlist_count = len(self.manager.list_playlists())
+        track_count, playlist_count = self.manager.counts()
         track_word = "track" if track_count == 1 else "tracks"
         playlist_word = "playlist" if playlist_count == 1 else "playlists"
         details = {
@@ -674,7 +673,9 @@ class SettingsPage(_Base):
                             bgcolor=hex_color,
                             border=ft.Border.all(
                                 3 if selected else 1,
-                                ft.Colors.ON_SURFACE if selected else ft.Colors.OUTLINE_VARIANT,
+                                ft.Colors.ON_SURFACE
+                                if selected
+                                else ft.Colors.OUTLINE_VARIANT,
                             ),
                             animate=ft.Animation(150, ft.AnimationCurve.EASE_OUT),
                         ),
@@ -682,7 +683,9 @@ class SettingsPage(_Base):
                             name.capitalize(),
                             size=11,
                             text_align=ft.TextAlign.CENTER,
-                            weight=ft.FontWeight.BOLD if selected else ft.FontWeight.NORMAL,
+                            weight=ft.FontWeight.BOLD
+                            if selected
+                            else ft.FontWeight.NORMAL,
                         ),
                     ],
                     spacing=4,
@@ -774,7 +777,7 @@ class SettingsPage(_Base):
             return
         if (
             folder.resolve() != Path(self.settings.download_directory).resolve()
-            and self.manager.list_tracks()
+            and self.manager.counts()[0]
         ):
             self._show_error(
                 "To protect existing files, the music folder can only be changed "
@@ -806,14 +809,14 @@ class SettingsPage(_Base):
             return
 
         restart_required = any(
-            [
+            (
                 str(folder) != self.settings.download_directory,
                 self.settings_format.value != self.settings.audio_format,
                 self.settings_quality.value != self.settings.audio_quality,
                 int(self.settings_concurrency.value or 0)
                 != self.settings.concurrent_downloads,
                 cookie_changed,
-            ]
+            )
         )
         self.settings.download_directory = str(folder)
         self.settings.audio_format = self.settings_format.value or "mp3"

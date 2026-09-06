@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
@@ -51,7 +51,11 @@ def is_youtube_url(value: str) -> bool:
 def is_youtube_playlist_url(value: str) -> bool:
     """Return whether *value* identifies a specific YouTube playlist."""
     parsed = urlsplit(value.strip())
-    return is_youtube_url(value) and bool(parse_qs(parsed.query).get("list"))
+    return (
+        parsed.scheme.casefold() in {"http", "https"}
+        and (parsed.hostname or "").casefold() in _YOUTUBE_HOSTS
+        and bool(parse_qs(parsed.query).get("list"))
+    )
 
 
 @dataclass(frozen=True)
@@ -63,9 +67,10 @@ class YtDlpProvider:
     yt_dlp_options: dict[str, Any] | None = None
 
     def accepts(self, query: str) -> bool:
-        if not _is_url(query):
+        parsed = urlsplit(query.strip())
+        if parsed.scheme.casefold() not in {"http", "https"}:
             return True
-        return is_youtube_url(query)
+        return (parsed.hostname or "").casefold() in _YOUTUBE_HOSTS
 
     def search(
         self, query: str, *, limit: int = 20, offset: int = 0
@@ -161,10 +166,7 @@ class ProviderRegistry:
         provider = self.get(provider_id)
         if not provider.accepts(query):
             raise ProviderError("Enter a search term or paste a YouTube URL.")
-        return [
-            replace(result, provider_id=provider_id)
-            for result in provider.search(query, limit=limit, offset=offset)
-        ]
+        return provider.search(query, limit=limit, offset=offset)
 
     def load_playlist(self, url: str) -> RemotePlaylist:
         return self._youtube.load_playlist(url)
@@ -194,12 +196,13 @@ def _results_from_info(
     )
     playlist_uploader = str(info.get("uploader") or info.get("channel") or "")
     raw_entries = entries if is_explicit_playlist else (entries or [info])
+    is_youtube_source = source.casefold().startswith("youtube")
     results: list[SearchResult] = []
     for entry in raw_entries or []:
         if not entry or len(results) >= limit:
             continue
         url = str(entry.get("webpage_url") or entry.get("url") or "")
-        if url and not _is_url(url) and source.casefold().startswith("youtube"):
+        if url and not _is_url(url) and is_youtube_source:
             url = f"https://www.youtube.com/watch?v={url}"
         results.append(
             SearchResult(
@@ -227,21 +230,23 @@ def _thumbnail_url(info: dict[str, Any]) -> str:
     if direct:
         return _absolute_thumbnail_url(direct)
 
-    candidates = [
-        candidate
-        for candidate in info.get("thumbnails") or []
-        if isinstance(candidate, dict) and str(candidate.get("url") or "").strip()
-    ]
-    if not candidates:
-        return ""
-
     def quality(candidate: dict[str, Any]) -> tuple[float, float]:
         width = _number(candidate.get("width"))
         height = _number(candidate.get("height"))
         preference = _number(candidate.get("preference"))
         return preference, width * height
 
-    best = max(candidates, key=quality)
+    best = max(
+        (
+            candidate
+            for candidate in info.get("thumbnails") or []
+            if isinstance(candidate, dict) and str(candidate.get("url") or "").strip()
+        ),
+        key=quality,
+        default=None,
+    )
+    if best is None:
+        return ""
     return _absolute_thumbnail_url(str(best["url"]).strip())
 
 

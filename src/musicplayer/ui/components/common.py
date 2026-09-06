@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import random
+from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -7,7 +9,6 @@ import flet as ft
 
 from musicplayer.application.models import DownloadRecord, TrackDetails
 from musicplayer.core.library.models import Playlist, Track
-from musicplayer.ui.theme import accent_color
 
 if TYPE_CHECKING:
     from musicplayer.ui._app_protocol import AppProtocol
@@ -24,28 +25,28 @@ class SharedUIComponents(_Base):
     GRID_GUTTER: ClassVar[dict[str, int]] = {"xs": 12, "md": 16, "xl": 18}
 
     def _play_collection(
-        self, tracks: list[Track] | tuple[Track, ...], *, shuffle: bool = False
+        self, tracks: Sequence[Track], *, shuffle: bool = False
     ) -> None:
         ids = [str(track.id) for track in tracks]
         if shuffle:
-            import random
-
             random.shuffle(ids)
         self.playback.play_tracks(ids)
 
-    def _queue_collection(self, tracks: list[Track] | tuple[Track, ...]) -> None:
-        items = list(tracks)
-        for track in items:
-            self.playback.add_last(str(track.id))
-        if items:
+    def _queue_collection(self, tracks: Sequence[Track]) -> None:
+        count = self.playback.add_last_many(str(track.id) for track in tracks)
+        if count:
             self._show_message(
-                f"Added {len(items)} track{'s' if len(items) != 1 else ''} to the queue."
+                f"Added {count} track{'s' if count != 1 else ''} to the queue."
             )
 
     def _playlist_card(self, playlist: Playlist) -> ft.Control:
-        tracks = self.manager.playlist_tracks(playlist.id)
-        artwork = self.library.details(tracks[0].id).thumbnail if tracks else ""
-        compact = self._is_compact()
+        track_count = len(playlist.track_ids)
+        artwork = (
+            self.library.details(playlist.track_ids[0]).thumbnail
+            if playlist.track_ids
+            else ""
+        )
+        compact = self.compact_layout
         accent = self._accent_hex()
         art_size = 120 if compact else 170
         card_widget = ft.Container(
@@ -76,7 +77,7 @@ class SharedUIComponents(_Base):
                         max_lines=1,
                     ),
                     ft.Text(
-                        f"{len(tracks)} track{'s' if len(tracks) != 1 else ''}",
+                        f"{track_count} track{'s' if track_count != 1 else ''}",
                         color=ft.Colors.ON_SURFACE_VARIANT,
                         size=12,
                     ),

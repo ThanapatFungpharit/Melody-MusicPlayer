@@ -36,10 +36,31 @@ class PlatformRuntimeTests(unittest.TestCase):
         self.assertEqual(current_architecture("arm64-v8a"), "arm64")
 
     def test_unsupported_runtime_has_an_actionable_error(self) -> None:
-        with self.assertRaisesRegex(UnsupportedPlatformError, "freebsd"):
-            current_platform("freebsd")
-        with self.assertRaisesRegex(UnsupportedPlatformError, "riscv64"):
-            current_architecture("riscv64")
+        for platform_name in ("freebsd", "cygwin", "linux2"):
+            with (
+                self.subTest(platform=platform_name),
+                self.assertRaisesRegex(UnsupportedPlatformError, platform_name),
+            ):
+                current_platform(platform_name)
+        for architecture in ("x86", "i686", "riscv64"):
+            with (
+                self.subTest(architecture=architecture),
+                self.assertRaisesRegex(UnsupportedPlatformError, architecture),
+            ):
+                current_architecture(architecture)
+
+    def test_architecture_must_be_supported_by_the_target_platform(self) -> None:
+        with self.assertRaisesRegex(
+            UnsupportedPlatformError, "architecture 'arm' for linux"
+        ):
+            media_binary_bundle(platform_name="linux", architecture="armv7l")
+
+        bundle = media_binary_bundle(
+            platform_name="android",
+            architecture="armv7l",
+            binary_root="/tmp/media",
+        )
+        self.assertEqual(bundle.architecture, "arm")
 
     def test_windows_bundle_uses_executable_suffix(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

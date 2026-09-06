@@ -65,6 +65,7 @@ class DownloadCoordinator:
     PROGRESS_NOTIFY_INTERVAL = 0.2
     PROGRESS_PERSIST_INTERVAL = 1.0
     MAX_RETAINED_RECORDS = 250
+    ACTIVE_STATUSES = frozenset({"queued", "downloading", "processing"})
 
     def __init__(
         self,
@@ -79,12 +80,14 @@ class DownloadCoordinator:
         self.settings = settings
         self.on_change = on_change
         self._lock = threading.RLock()
-        self._last_progress_notify: dict[str, float] = {}
-        self._last_progress_persist: dict[str, float] = {}
+        self._last_progress_notify = 0.0
+        self._last_progress_persist = 0.0
         self._records = {record.id: record for record in store.downloads()}
+        self._ordered_records: tuple[DownloadRecord, ...] | None = None
+        self._active_records_by_source: dict[str, str] = {}
         recovered = False
         for record in self._records.values():
-            if record.status in {"queued", "downloading", "processing"}:
+            if record.status in self.ACTIVE_STATUSES:
                 recovered = True
                 record.status = "failed"
                 record.error = (
@@ -101,13 +104,25 @@ class DownloadCoordinator:
 
     def list(self) -> tuple[DownloadRecord, ...]:
         with self._lock:
-            return tuple(
-                sorted(
-                    self._records.values(),
-                    key=lambda item: (item.created_at, -item.batch_position),
-                    reverse=True,
+            if self._ordered_records is None:
+                self._ordered_records = tuple(
+                    sorted(
+                        self._records.values(),
+                        key=lambda item: (item.created_at, -item.batch_position),
+                        reverse=True,
+                    )
                 )
-            )
+            return self._ordered_records
+
+    def get(self, record_id: str) -> DownloadRecord | None:
+        """Return a history record by identifier without sorting all records."""
+        with self._lock:
+            return self._records.get(str(record_id))
+
+    def active_count(self) -> int:
+        """Return the number of downloads still owned by the core service."""
+        with self._lock:
+            return len(self._active_records_by_source)
 
     def is_source_active(self, url: str) -> bool:
         """Return whether an equivalent source is already being downloaded."""
@@ -117,8 +132,13 @@ class DownloadCoordinator:
     def start(self, result: SearchResult) -> DownloadTask:
         if not result.url:
             raise ValueError("This result does not provide a downloadable URL.")
-        if not result.is_playlist and self.manager.find_track_by_source(result.url):
-            raise DuplicateDownloadError("This track is already in your library.")
+        if not result.is_playlist:
+            existing = self.manager.find_track_by_source(result.url)
+            if (
+                existing is not None
+                and self.manager.check_track_integrity(existing.id) is None
+            ):
+                raise DuplicateDownloadError("This track is already in your library.")
         metadata = {
             "url": result.url,
             "title": result.title,
@@ -233,12 +253,12 @@ class DownloadCoordinator:
 
     def clear_finished(self) -> None:
         with self._lock:
-            active = {"queued", "downloading", "processing"}
             self._records = {
                 key: value
                 for key, value in self._records.items()
-                if value.status in active
+                if value.status in self.ACTIVE_STATUSES
             }
+            self._ordered_records = None
             self._persist()
 
     def shutdown(self) -> None:
@@ -250,7 +270,11 @@ class DownloadCoordinator:
         with self._lock:
             record = self._record(progress.task, metadata)
             previous_status = record.status
-            record.status = progress.status.value
+            record.status = (
+                DownloadStatus.PROCESSING.value
+                if progress.status is DownloadStatus.COMPLETED
+                else progress.status.value
+            )
             record.progress = progress.progress
             record.filename = Path(progress.filename).name if progress.filename else ""
             record.downloaded_bytes = progress.downloaded_bytes
@@ -262,19 +286,19 @@ class DownloadCoordinator:
                 record.thumbnail = progress.thumbnail or record.thumbnail
             now = time.monotonic()
             status_changed = record.status != previous_status
-            persisted_at = self._last_progress_persist.get(record.id, 0.0)
-            notified_at = self._last_progress_notify.get(record.id, 0.0)
             should_persist = (
-                status_changed or now - persisted_at >= self.PROGRESS_PERSIST_INTERVAL
+                status_changed
+                or now - self._last_progress_persist >= self.PROGRESS_PERSIST_INTERVAL
             )
             should_notify = (
-                status_changed or now - notified_at >= self.PROGRESS_NOTIFY_INTERVAL
+                status_changed
+                or now - self._last_progress_notify >= self.PROGRESS_NOTIFY_INTERVAL
             )
             if should_persist:
                 self._persist()
-                self._last_progress_persist[record.id] = now
+                self._last_progress_persist = now
             if should_notify:
-                self._last_progress_notify[record.id] = now
+                self._last_progress_notify = now
         if should_notify:
             self._notify(record)
 
@@ -283,8 +307,16 @@ class DownloadCoordinator:
     ) -> None:
         with self._lock:
             record = self._record(result.task, metadata)
+            uploader = record.uploader
+            thumbnail = record.thumbnail
+        final_status = result.status.value
+        final_error = _friendly_download_error(result.error)
+        imported: list[str] | None = None
+        stored_filename: str | None = None
+        completed_at: float | None = None
         if result.status is DownloadStatus.COMPLETED:
-            imported: list[str] = []
+            imported = []
+            stored_paths: list[Path] = []
             try:
                 for path in result.files:
                     source = str(metadata["url"])
@@ -293,16 +325,23 @@ class DownloadCoordinator:
                     ) or self.manager.find_track_by_content(path)
                     if existing is not None:
                         track_id = existing.id
-                        existing_path = self.manager.track_path(existing.id)
-                        if path.resolve() != existing_path.resolve():
-                            path.unlink()
+                        problem = self.manager.check_track_integrity(existing.id)
+                        if problem is None:
+                            existing_path = self.manager.track_path(existing.id)
+                            if path.resolve() != existing_path.resolve():
+                                path.unlink()
+                            stored_path = existing_path
+                        else:
+                            self.manager.replace_track_file(existing.id, path)
+                            stored_path = self.manager.track_path(existing.id)
                         if not existing.source:
                             self.manager.update_track(existing.id, source=source)
                         logger.info(
-                            "Downloaded duplicate reused existing library track: "
-                            "source=%s track_id=%s",
+                            "Downloaded media reused or repaired a library track: "
+                            "source=%s track_id=%s integrity=%s",
                             source,
                             track_id,
+                            problem.kind if problem else "intact",
                         )
                     else:
                         track_id = self.manager.add_track(
@@ -311,32 +350,41 @@ class DownloadCoordinator:
                             title=str(metadata.get("title") or path.stem),
                         )
                         details = TrackDetails(
-                            uploader=record.uploader,
+                            uploader=uploader,
                             duration=float(str(metadata.get("duration") or 0)),
-                            thumbnail=record.thumbnail,
+                            thumbnail=thumbnail,
                             source_name=str(metadata.get("source") or "YouTube"),
                         )
                         self.store.save_track_details(str(track_id), details)
+                        stored_path = self.manager.track_path(track_id)
                     imported.append(str(track_id))
+                    stored_paths.append(stored_path)
             except Exception as error:
                 logger.exception(
                     "Downloaded media could not be imported into the library"
                 )
-                record.status = "failed"
-                record.error = f"Downloaded, but could not add to the library: {error}"
+                final_status = "failed"
+                final_error = f"Downloaded, but could not add to the library: {error}"
+                imported = None
             else:
-                record.status = "completed"
+                if stored_paths:
+                    stored_filename = stored_paths[0].name
+                completed_at = time.time()
+        with self._lock:
+            record.status = final_status
+            record.error = final_error
+            if imported is not None:
+                assert completed_at is not None
                 record.progress = 1.0
                 record.track_ids = imported
-                record.completed_at = time.time()
-        else:
-            record.status = result.status.value
-            record.error = _friendly_download_error(result.error)
-        with self._lock:
+                if stored_filename is not None:
+                    record.filename = stored_filename
+                record.completed_at = completed_at
+            identity = source_key(record.url)
+            if self._active_records_by_source.get(identity) == record.id:
+                self._active_records_by_source.pop(identity, None)
             self._prune_records_locked()
             self._persist()
-            self._last_progress_notify.pop(record.id, None)
-            self._last_progress_persist.pop(record.id, None)
         self._notify(record)
 
     def _record(
@@ -359,6 +407,10 @@ class DownloadCoordinator:
                 batch_size=int(str(metadata.get("batch_size") or 0)),
             )
             self._records[key] = record
+            identity = source_key(record.url)
+            if identity:
+                self._active_records_by_source[identity] = record.id
+            self._ordered_records = None
             self._prune_records_locked()
         return record
 
@@ -383,29 +435,30 @@ class DownloadCoordinator:
         )
         with self._lock:
             self._records[record.id] = record
+            self._ordered_records = None
             self._prune_records_locked()
             self._persist()
         self._notify(record)
 
     def _persist(self) -> None:
-        self.store.save_downloads(list(self._records.values()))
+        self.store.save_downloads(self._records.values())
 
     def _prune_records_locked(self) -> None:
         """Retain bounded history while never evicting an active operation."""
         excess = len(self._records) - self.MAX_RETAINED_RECORDS
         if excess <= 0:
             return
-        active = {"queued", "downloading", "processing"}
         finished = sorted(
             (
                 record
                 for record in self._records.values()
-                if record.status not in active
+                if record.status not in self.ACTIVE_STATUSES
             ),
             key=lambda record: record.created_at,
         )
         for record in finished[:excess]:
             self._records.pop(record.id, None)
+        self._ordered_records = None
 
     def _notify(self, record: DownloadRecord) -> None:
         if self.on_change:
@@ -417,15 +470,8 @@ class DownloadCoordinator:
 
     def _active_record_for_source_locked(self, url: str) -> DownloadRecord | None:
         identity = source_key(url)
-        active = {"queued", "downloading", "processing"}
-        return next(
-            (
-                record
-                for record in self._records.values()
-                if record.status in active and source_key(record.url) == identity
-            ),
-            None,
-        )
+        record_id = self._active_records_by_source.get(identity)
+        return self._records.get(record_id) if record_id is not None else None
 
 
 def _uuid(value: str):

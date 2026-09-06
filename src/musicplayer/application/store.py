@@ -4,11 +4,14 @@ import json
 import os
 import tempfile
 import threading
+from collections.abc import Iterable
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
 from .models import AppSettings, DownloadRecord, TrackDetails
+
+_MISSING = object()
 
 
 class ApplicationStore:
@@ -26,11 +29,17 @@ class ApplicationStore:
         self._data = self._load()
 
     def _load(self) -> dict[str, Any]:
-        if not self.path.exists() or self.path.stat().st_size == 0:
+        try:
+            contents = self.path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return self._defaults()
+        except OSError as error:
+            raise ValueError(f"Could not read application settings: {error}") from error
+        if not contents:
             return self._defaults()
         try:
-            raw = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as error:
+            raw = json.loads(contents)
+        except json.JSONDecodeError as error:
             raise ValueError(f"Could not read application settings: {error}") from error
         if not isinstance(raw, dict):
             raise TypeError("Application settings must contain a JSON object")
@@ -99,8 +108,13 @@ class ApplicationStore:
             value = settings.to_dict()
             if self._data["settings"] == value:
                 return
+            previous = self._data["settings"]
             self._data["settings"] = value
-            self._save_locked()
+            try:
+                self._save_locked()
+            except Exception:
+                self._data["settings"] = previous
+                raise
 
     def track_details(self, track_id: str) -> TrackDetails:
         with self._lock:
@@ -109,19 +123,45 @@ class ApplicationStore:
             # shared with the store by this conversion.
             return TrackDetails.from_dict(raw)
 
+    def favorite_track_ids(self) -> frozenset[str]:
+        """Return favorite identifiers with one lock acquisition and no aliases."""
+        with self._lock:
+            return frozenset(
+                str(track_id)
+                for track_id, details in self._data["track_details"].items()
+                if isinstance(details, dict) and bool(details.get("favorite"))
+            )
+
     def save_track_details(self, track_id: str, details: TrackDetails) -> None:
         with self._lock:
             key = str(track_id)
             value = details.to_dict()
             if self._data["track_details"].get(key) == value:
                 return
-            self._data["track_details"][key] = value
-            self._save_locked()
+            details_by_track = self._data["track_details"]
+            previous = details_by_track.get(key, _MISSING)
+            details_by_track[key] = value
+            try:
+                self._save_locked()
+            except Exception:
+                if previous is _MISSING:
+                    details_by_track.pop(key, None)
+                else:
+                    details_by_track[key] = previous
+                raise
 
     def remove_track_details(self, track_id: str) -> None:
         with self._lock:
-            self._data["track_details"].pop(str(track_id), None)
-            self._save_locked()
+            details_by_track = self._data["track_details"]
+            key = str(track_id)
+            if key not in details_by_track:
+                return
+            previous = details_by_track.pop(key)
+            try:
+                self._save_locked()
+            except Exception:
+                details_by_track[key] = previous
+                raise
 
     def clear_library_data(self) -> None:
         """Clear state that refers to library tracks, preserving other app data."""
@@ -144,8 +184,17 @@ class ApplicationStore:
             }
             if all(self._data.get(key) == value for key, value in replacements.items()):
                 return
+            previous = {key: self._data.get(key, _MISSING) for key in replacements}
             self._data.update(replacements)
-            self._save_locked()
+            try:
+                self._save_locked()
+            except Exception:
+                for key, value in previous.items():
+                    if value is _MISSING:
+                        self._data.pop(key, None)
+                    else:
+                        self._data[key] = value
+                raise
 
     def get(self, key: str, default: Any = None) -> Any:
         with self._lock:
@@ -156,13 +205,30 @@ class ApplicationStore:
             copied = deepcopy(value)
             if self._data.get(key) == copied:
                 return
+            previous = self._data.get(key, _MISSING)
             self._data[key] = copied
-            self._save_locked()
+            try:
+                self._save_locked()
+            except Exception:
+                if previous is _MISSING:
+                    self._data.pop(key, None)
+                else:
+                    self._data[key] = previous
+                raise
 
     def add_recent(self, key: str, value: str, *, limit: int = 50) -> None:
         with self._lock:
-            self._add_recent_locked(key, value, limit=limit)
-            self._save_locked()
+            previous = self._data.get(key, _MISSING)
+            if not self._add_recent_locked(key, value, limit=limit):
+                return
+            try:
+                self._save_locked()
+            except Exception:
+                if previous is _MISSING:
+                    self._data.pop(key, None)
+                else:
+                    self._data[key] = previous
+                raise
 
     def record_play(
         self,
@@ -180,29 +246,96 @@ class ApplicationStore:
         """
         key = str(track_id)
         with self._lock:
-            details = TrackDetails.from_dict(self._data["track_details"].get(key, {}))
+            fields = ("recent_tracks", "playback_history", "playback")
+            previous = {name: self._data.get(name, _MISSING) for name in fields}
+            details_by_track = self._data["track_details"]
+            previous_details = details_by_track.get(key, _MISSING)
+            details = TrackDetails.from_dict(details_by_track.get(key, {}))
             details.play_count += 1
             details.last_played = float(played_at)
-            self._data["track_details"][key] = details.to_dict()
+            details_by_track[key] = details.to_dict()
             self._add_recent_locked("recent_tracks", key, limit=20)
             self._add_recent_locked("playback_history", key, limit=100)
             if playback is not None:
                 self._data["playback"] = deepcopy(playback)
-            self._save_locked()
+            try:
+                self._save_locked()
+            except Exception:
+                if previous_details is _MISSING:
+                    details_by_track.pop(key, None)
+                else:
+                    details_by_track[key] = previous_details
+                for name, value in previous.items():
+                    if value is _MISSING:
+                        self._data.pop(name, None)
+                    else:
+                        self._data[name] = value
+                raise
 
     def downloads(self) -> list[DownloadRecord]:
-        return [DownloadRecord.from_dict(item) for item in self.get("downloads", [])]
+        with self._lock:
+            return [
+                DownloadRecord.from_dict(item)
+                for item in self._data.get("downloads", [])
+            ]
 
-    def save_downloads(self, records: list[DownloadRecord]) -> None:
-        self.set("downloads", [record.to_dict() for record in records[-250:]])
+    def save_downloads(self, records: Iterable[DownloadRecord]) -> None:
+        value = [record.to_dict() for record in records]
+        if len(value) > 250:
+            value = value[-250:]
+        with self._lock:
+            if self._data.get("downloads") == value:
+                return
+            previous = self._data.get("downloads", _MISSING)
+            self._data["downloads"] = value
+            try:
+                self._save_locked()
+            except Exception:
+                if previous is _MISSING:
+                    self._data.pop("downloads", None)
+                else:
+                    self._data["downloads"] = previous
+                raise
 
-    def _add_recent_locked(self, key: str, value: str, *, limit: int) -> None:
+    def favorite_tracks(self, track_ids: Iterable[str]) -> int:
+        """Mark several tracks as favorites with one atomic state write."""
+        changed = 0
+        with self._lock:
+            previous = self._data["track_details"]
+            details_by_track = previous
+            for track_id in track_ids:
+                key = str(track_id)
+                details = TrackDetails.from_dict(details_by_track.get(key, {}))
+                if details.favorite:
+                    continue
+                if details_by_track is previous:
+                    details_by_track = dict(previous)
+                details.favorite = True
+                details_by_track[key] = details.to_dict()
+                changed += 1
+            if changed:
+                self._data["track_details"] = details_by_track
+                try:
+                    self._save_locked()
+                except Exception:
+                    self._data["track_details"] = previous
+                    raise
+        return changed
+
+    def _add_recent_locked(self, key: str, value: str, *, limit: int) -> bool:
         items = self._data.get(key, [])
-        # Histories are intentionally small and ordered. Avoid allocating an
-        # unbounded intermediate list before applying the configured cap.
-        recent = [value]
-        recent.extend(item for item in items if item != value)
-        self._data[key] = recent[:limit]
+        recent: list[str] = []
+        if limit > 0:
+            recent.append(value)
+            for item in items:
+                if item != value:
+                    recent.append(item)
+                    if len(recent) >= limit:
+                        break
+        if recent == items:
+            return False
+        self._data[key] = recent
+        return True
 
     def _save_locked(self) -> None:
         # Compact JSON materially reduces bytes encoded and flushed for hot

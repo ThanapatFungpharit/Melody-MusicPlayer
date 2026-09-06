@@ -12,5 +12,6 @@ def main() -> None:
 
     ft.run(app_main)
 
+
 if __name__ == "__main__":
     main()

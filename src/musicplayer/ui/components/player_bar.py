@@ -243,7 +243,10 @@ class PlayerBar(_Base):
             )
             self.player_bar.height = 96
             self.player_bar.padding = ft.Padding.only(
-                left=14, right=14, top=6, bottom=4,
+                left=14,
+                right=14,
+                top=6,
+                bottom=4,
             )
         else:
             # -- desktop / wide layout -----------------------------------
@@ -277,12 +280,12 @@ class PlayerBar(_Base):
             self.player_bar.content = self.player_layout
             self.player_bar.height = 104
             self.player_bar.padding = ft.Padding.symmetric(
-                horizontal=22, vertical=10,
+                horizontal=22,
+                vertical=10,
             )
 
     def _refresh_player(self) -> None:
         current_id = self.playback.current_track_id
-        details = None
         if self.playback.external_title:
             title = self.playback.external_title
             credit = self.playback.external_uploader or "Streaming preview"
@@ -290,21 +293,30 @@ class PlayerBar(_Base):
             self.favorite_button.disabled = True
             self.favorite_button.icon = ft.Icons.FAVORITE_BORDER_ROUNDED
             self.favorite_button.icon_color = None
-        elif current_id and self.manager.has_track(current_id):
-            track = self.manager.get_track(current_id)
-            details = self.library.details(current_id)
-            title = _track_title(track)
-            credit = _track_credit(details)
-            thumbnail = details.thumbnail
-            self.favorite_button.disabled = False
-            self.favorite_button.icon = (
-                ft.Icons.FAVORITE_ROUNDED
-                if details.favorite
-                else ft.Icons.FAVORITE_BORDER_ROUNDED
-            )
-            self.favorite_button.icon_color = (
-                ft.Colors.PINK_400 if details.favorite else None
-            )
+        elif current_id:
+            try:
+                track = self.manager.get_track(current_id)
+            except (KeyError, TypeError, ValueError):
+                title = "Nothing playing"
+                credit = "Choose something from your library"
+                thumbnail = ""
+                self.favorite_button.disabled = True
+                self.favorite_button.icon = ft.Icons.FAVORITE_BORDER_ROUNDED
+                self.favorite_button.icon_color = None
+            else:
+                details = self.library.details(current_id)
+                title = _track_title(track)
+                credit = _track_credit(details)
+                thumbnail = details.thumbnail
+                self.favorite_button.disabled = False
+                self.favorite_button.icon = (
+                    ft.Icons.FAVORITE_ROUNDED
+                    if details.favorite
+                    else ft.Icons.FAVORITE_BORDER_ROUNDED
+                )
+                self.favorite_button.icon_color = (
+                    ft.Colors.PINK_400 if details.favorite else None
+                )
         else:
             title = "Nothing playing"
             credit = "Choose something from your library"

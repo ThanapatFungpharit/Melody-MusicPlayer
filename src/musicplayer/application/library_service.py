@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import logging
 import shutil
 import time
+from collections.abc import Iterable
 from pathlib import Path
 from uuid import UUID
 
@@ -10,6 +12,8 @@ from musicplayer.core.library.models import Playlist, Track
 
 from .models import TrackDetails
 from .store import ApplicationStore
+
+logger = logging.getLogger(__name__)
 
 
 class LibraryService:
@@ -34,6 +38,10 @@ class LibraryService:
         details.favorite = not details.favorite
         self.store.save_track_details(str(track_id), details)
         return details.favorite
+
+    def favorite_tracks(self, track_ids: Iterable[UUID | str]) -> int:
+        """Favorite several tracks with a single durable store update."""
+        return self.store.favorite_tracks(str(track_id) for track_id in track_ids)
 
     def record_play(
         self, track_id: UUID | str, *, playback: dict[str, object] | None = None
@@ -75,10 +83,35 @@ class LibraryService:
         except Exception:
             destination.unlink(missing_ok=True)
             raise
-        self.store.save_track_details(
-            str(track_id),
-            TrackDetails(source_name="Local file"),
-        )
+        try:
+            self.store.save_track_details(
+                str(track_id),
+                TrackDetails(source_name="Local file"),
+            )
+        except Exception:
+            # Registration and enriched metadata live in separate atomic
+            # stores. Compensate if the second commit fails so callers never
+            # receive an error while a half-imported track remains visible.
+            try:
+                self.manager.delete_track(track_id)
+            except Exception:
+                # Keep the copied file when registration rollback fails; the
+                # surviving track still references it and can be repaired.
+                logger.exception(
+                    "Could not roll back a local track after metadata save failure: "
+                    "track_id=%s",
+                    track_id,
+                )
+            else:
+                try:
+                    destination.unlink(missing_ok=True)
+                except OSError:
+                    logger.warning(
+                        "Could not remove a copied file after import rollback: path=%s",
+                        destination,
+                        exc_info=True,
+                    )
+            raise
         return track_id
 
     def _available_destination(self, name: str) -> Path:
@@ -94,12 +127,15 @@ class LibraryService:
         return destination
 
     def tracks(self, *, query: str = "", sort: str = "recent") -> tuple[Track, ...]:
-        tracks = list(self.manager.search_tracks(query))
+        matching_tracks = self.manager.search_tracks(query)
+        if sort == "recent":
+            return matching_tracks
+        tracks = list(matching_tracks)
         if sort == "title":
             tracks.sort(
                 key=lambda item: (item.title or Path(item.filename).stem).casefold()
             )
-        elif sort == "oldest":
+        if sort == "oldest":
             tracks.sort(key=lambda item: item.added_at)
         return tuple(tracks)
 

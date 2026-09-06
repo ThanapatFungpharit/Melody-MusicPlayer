@@ -111,6 +111,40 @@ class StoreTests(unittest.TestCase):
             store.add_recent("search_history", "one")
             self.assertEqual(store.get("search_history"), ["one", "two"])
 
+    def test_bulk_favorites_use_one_atomic_write(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = ApplicationStore(Path(directory) / "state.json")
+            with patch.object(store, "_save_locked", wraps=store._save_locked) as save:
+                changed = store.favorite_tracks(("one", "two", "one"))
+
+            self.assertEqual(changed, 2)
+            self.assertEqual(save.call_count, 1)
+            self.assertTrue(store.track_details("one").favorite)
+            self.assertTrue(store.track_details("two").favorite)
+            self.assertEqual(store.favorite_track_ids(), frozenset({"one", "two"}))
+
+    def test_readding_first_recent_value_skips_redundant_write(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = ApplicationStore(Path(directory) / "state.json")
+            store.add_recent("search_history", "same")
+            with patch.object(store, "_save_locked", wraps=store._save_locked) as save:
+                store.add_recent("search_history", "same")
+
+            save.assert_not_called()
+
+    def test_failed_atomic_write_restores_in_memory_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = ApplicationStore(Path(directory) / "state.json")
+            store.set("custom", {"value": "before"})
+
+            with (
+                patch.object(store, "_save_locked", side_effect=OSError("disk full")),
+                self.assertRaisesRegex(OSError, "disk full"),
+            ):
+                store.set("custom", {"value": "after"})
+
+            self.assertEqual(store.get("custom"), {"value": "before"})
+
     def test_record_play_commits_metadata_and_histories_once(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = ApplicationStore(Path(directory) / "state.json")
@@ -128,6 +162,21 @@ class StoreTests(unittest.TestCase):
             self.assertEqual(store.get("recent_tracks"), ["track"])
             self.assertEqual(store.get("playback_history"), ["track"])
             self.assertEqual(store.get("playback")["queue"], ["track"])
+
+    def test_failed_play_record_restores_metadata_and_histories(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = ApplicationStore(Path(directory) / "state.json")
+            store.record_play("track", played_at=1.0)
+
+            with (
+                patch.object(store, "_save_locked", side_effect=OSError("disk full")),
+                self.assertRaisesRegex(OSError, "disk full"),
+            ):
+                store.record_play("other", played_at=2.0)
+
+            self.assertEqual(store.track_details("other").play_count, 0)
+            self.assertEqual(store.get("recent_tracks"), ["track"])
+            self.assertEqual(store.get("playback_history"), ["track"])
 
     def test_clear_library_data_preserves_unrelated_state(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

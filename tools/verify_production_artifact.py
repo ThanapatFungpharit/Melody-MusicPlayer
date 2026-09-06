@@ -162,14 +162,19 @@ def _looks_like_distribution(component: str, package: str) -> bool:
 
 def _path_violation(path: str, development_packages: set[str]) -> str | None:
     normalized_path = path.replace("\\", "/").replace("!", "/").strip("/")
-    parts = [part for part in PurePosixPath(normalized_path).parts if part not in {"", "."}]
+    parts = [
+        part for part in PurePosixPath(normalized_path).parts if part not in {"", "."}
+    ]
     folded_parts = [part.casefold() for part in parts]
     filename = folded_parts[-1] if folded_parts else ""
 
     forbidden_directory = next(
-        (part for i, part in enumerate(folded_parts[:-1]) 
-         if part in _FORBIDDEN_DIRECTORY_NAMES
-         and not (part == "__pycache__" and "stdlib" in folded_parts[:i])),
+        (
+            part
+            for i, part in enumerate(folded_parts[:-1])
+            if part in _FORBIDDEN_DIRECTORY_NAMES
+            and not (part == "__pycache__" and "stdlib" in folded_parts[:i])
+        ),
         None,
     )
     if forbidden_directory:
@@ -326,9 +331,7 @@ class ArtifactAudit:
                 )
 
 
-def audit_artifacts(
-    artifacts: Iterable[Path], project_file: Path
-) -> ArtifactAudit:
+def audit_artifacts(artifacts: Iterable[Path], project_file: Path) -> ArtifactAudit:
     development_packages = (
         dependency_group_packages(project_file) | _KNOWN_DEVELOPMENT_PACKAGES
     )

@@ -3,7 +3,10 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+from musicplayer.application.library_service import LibraryService
+from musicplayer.application.store import ApplicationStore
 from musicplayer.core.library import MusicManager
 
 
@@ -72,6 +75,62 @@ class MusicManagerTests(unittest.TestCase):
             [first, second, third],
         )
 
+    def test_merge_playlist_orders_imported_tracks_with_one_write(self) -> None:
+        first = self.add_track("first.mp3")
+        second = self.add_track("second.mp3")
+        retained = self.add_track("retained.mp3")
+        playlist = self.manager.create_playlist("Import")
+        self.manager.add_to_playlist(playlist, retained)
+
+        with patch.object(self.manager, "_save", wraps=self.manager._save) as save:
+            added = self.manager.merge_tracks_into_playlist(
+                playlist, [second, first, second]
+            )
+
+        self.assertEqual(added, 2)
+        self.assertEqual(save.call_count, 1)
+        self.assertEqual(
+            [track.id for track in self.manager.playlist_tracks(playlist)],
+            [second, first, retained],
+        )
+
+    def test_failed_track_update_rolls_back_metadata_and_source_index(self) -> None:
+        track_id = self.add_track("rollback.mp3", "https://example.test/old")
+
+        with (
+            patch.object(self.manager, "_save", side_effect=OSError("disk full")),
+            self.assertRaisesRegex(OSError, "disk full"),
+        ):
+            self.manager.update_track(
+                track_id,
+                title="Changed",
+                source="https://example.test/new",
+            )
+
+        track = self.manager.get_track(track_id)
+        self.assertEqual(track.title, "rollback")
+        self.assertEqual(track.source, "https://example.test/old")
+        self.assertEqual(
+            self.manager.find_track_by_source("https://example.test/old").id,  # ty: ignore[unresolved-attribute]
+            track_id,
+        )
+        self.assertIsNone(self.manager.find_track_by_source("https://example.test/new"))
+
+    def test_local_import_rolls_back_when_metadata_store_fails(self) -> None:
+        source = self.root / "outside.mp3"
+        source.write_bytes(b"local audio")
+        store = ApplicationStore(self.root / "state.json")
+        library = LibraryService(self.manager, store)
+
+        with (
+            patch.object(store, "save_track_details", side_effect=OSError("disk full")),
+            self.assertRaisesRegex(OSError, "disk full"),
+        ):
+            library.import_local_file(source)
+
+        self.assertEqual(self.manager.list_tracks(), ())
+        self.assertFalse((self.music / source.name).exists())
+
     def test_delete_track_keeps_file(self) -> None:
         track_id = self.add_track("safe.mp3")
         path = self.manager.track_path(track_id)
@@ -112,6 +171,30 @@ class MusicManagerTests(unittest.TestCase):
         outside = self.root / "outside.mp3"
         outside.write_bytes(b"audio:same.mp3")
         self.assertEqual(self.manager.find_track_by_content(outside).id, track_id)  # ty: ignore[unresolved-attribute]
+
+    def test_replace_track_file_updates_hash_and_preserves_track_identity(self) -> None:
+        track_id = self.add_track("old.mp3")
+        playlist_id = self.manager.create_playlist("Kept")
+        self.manager.add_to_playlist(playlist_id, track_id)
+        replacement = self.music / "replacement.mp3"
+        replacement.write_bytes(b"replacement audio")
+
+        self.manager.replace_track_file(track_id, replacement)
+
+        self.assertEqual(self.manager.track_path(track_id), replacement)
+        self.assertIsNone(self.manager.check_track_integrity(track_id))
+        self.assertEqual(self.manager.playlist_tracks(playlist_id)[0].id, track_id)
+
+    def test_integrity_check_reports_a_registered_file_that_becomes_empty(
+        self,
+    ) -> None:
+        track_id = self.add_track("emptied.mp3")
+        self.manager.track_path(track_id).write_bytes(b"")
+
+        problem = self.manager.check_track_integrity(track_id)
+
+        assert problem is not None
+        self.assertEqual(problem.kind, "empty")
 
     def test_lookup_indexes_follow_source_updates_and_deletion(self) -> None:
         track_id = self.add_track("indexed.mp3", "https://example.test/old")

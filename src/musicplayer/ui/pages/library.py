@@ -124,11 +124,11 @@ class LibraryPage(_Base):
             self.library_mode = "tracks"
         query = getattr(self, "library_query", None)
         sort = getattr(self, "library_sort", None)
-        tracks = self.library.tracks(
-            query=query.value if query else "",
-            sort=(sort.value or "recent") if sort else "recent",
-        )
         if self.library_mode == "tracks":
+            tracks = self.library.tracks(
+                query=query.value if query else "",
+                sort=(sort.value or "recent") if sort else "recent",
+            )
             # Playlist menus share one immutable snapshot for the whole render;
             # fetching and copying the same collection once per row made large
             # libraries increasingly expensive to display.
@@ -263,7 +263,7 @@ class LibraryPage(_Base):
                 ),
             ]
         )
-        compact = self._is_compact()
+        compact = self.compact_layout
         leading: list[ft.Control] = []
         if not compact:
             leading.append(
@@ -373,6 +373,8 @@ class LibraryPage(_Base):
             self.page.pop_dialog()
             self._refresh_library_list()
             self._refresh_player()
+            if self.playback.current_track_id == str(track.id):
+                self._sync_system_media()
 
         self.page.show_dialog(
             ft.AlertDialog(

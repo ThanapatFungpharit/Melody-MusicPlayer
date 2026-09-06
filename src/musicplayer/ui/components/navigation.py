@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Any
 
 import flet as ft
 
-from musicplayer.ui.theme import accent_color
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from musicplayer.ui._app_protocol import AppProtocol
@@ -89,6 +90,7 @@ class NavigationShell(_Base):
             on_change=lambda event: self.navigate(int(event.control.selected_index)),
         )
         from typing import cast
+
         trailing = cast(ft.Column, self.rail.trailing)
         self.download_button = cast(ft.IconButton, trailing.controls[1])
         self._refresh_download_badge()
@@ -262,7 +264,9 @@ class NavigationShell(_Base):
         try:
             self.page.update(leading)
         except Exception:
-            pass
+            logger.debug(
+                "Logo hover update skipped after window disposal", exc_info=True
+            )
 
     def navigate(self, index: int) -> None:
         self.selected_navigation = max(0, min(index, len(self.NAVIGATION) - 1))

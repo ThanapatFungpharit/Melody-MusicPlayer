@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
 from collections.abc import Awaitable, Callable
-from typing import Any
+from concurrent.futures import Future
+from typing import Any, cast
 
 import flet as ft
 import flet_audio as fa
@@ -40,12 +40,12 @@ class FletAudioBackend:
         self._closing = False
         self._pending_play_position: int | None = None
         self._pending_seek_position: int | None = None
+        self._load_watchdog: Future[Any] | None = None
         self._operation_lock = asyncio.Lock()
         self._media_operation_lock = asyncio.Lock()
         self._media_generation = 0
         self._media_snapshot: tuple[object, ...] | None = None
         self._media_session_active = False
-        self._last_error_at = 0.0
         self.media_session = BackgroundAudioSession(on_action=self._media_action)
         self.page.services.append(self.media_session)
 
@@ -89,20 +89,25 @@ class FletAudioBackend:
         while the display is off.
         """
         clean_title = title.strip()
+        duration = max(0, int(duration_ms))
         position = max(0, int(position_ms))
-        position_marker = position // 5_000 if playing else position
+        is_playing = bool(playing)
+        can_skip_next = bool(has_next)
+        can_skip_previous = bool(has_previous)
+        is_shuffled = bool(shuffle)
+        position_marker = position // 5_000 if is_playing else position
         snapshot: tuple[object, ...] = (
             clean_title,
             artist,
             album,
             artwork_uri,
-            max(0, int(duration_ms)),
+            duration,
             position_marker,
-            bool(playing),
-            bool(has_next),
-            bool(has_previous),
+            is_playing,
+            can_skip_next,
+            can_skip_previous,
             repeat_mode,
-            bool(shuffle),
+            is_shuffled,
         )
         if snapshot == self._media_snapshot or self._closing:
             return
@@ -114,15 +119,14 @@ class FletAudioBackend:
             "artist": artist,
             "album": album,
             "artwork_uri": artwork_uri,
-            "duration_ms": max(0, int(duration_ms)),
+            "duration_ms": duration,
             "position_ms": position,
-            "playing": bool(playing),
-            "has_next": bool(has_next),
-            "has_previous": bool(has_previous),
+            "playing": is_playing,
+            "has_next": can_skip_next,
+            "has_previous": can_skip_previous,
             "repeat_mode": repeat_mode,
-            "shuffle": bool(shuffle),
+            "shuffle": is_shuffled,
         }
-        from typing import cast
         try:
             self.page.run_task(self._run_media_sync, generation, cast(Any, payload))
         except Exception:
@@ -133,37 +137,69 @@ class FletAudioBackend:
     def load(self, source: AudioSource) -> None:
         if self._closing:
             return
+        self._cancel_load_watchdog()
         self._generation += 1
         generation = self._generation
         self._loaded = False
         self._pending_play_position = None
         self._pending_seek_position = None
 
-        previous = self.audio
-        if previous is not None:
-            try:
-                self.page.services.remove(previous)
-            except ValueError:
-                pass
-
-        self.audio = fa.Audio(
-            src=source,
-            autoplay=False,
-            volume=self._volume,
-            release_mode=fa.ReleaseMode.STOP,
-            on_loaded=lambda _event: self._loaded_event(generation),
-            on_position_change=lambda event: self._position_changed(event, generation),
-            on_duration_change=lambda event: self._duration_changed(event, generation),
-            on_state_change=lambda event: self._state_changed(event, generation),
-        )
-        self.page.services.append(self.audio)
-        self.page.update()
+        # Sources can become ready on a download or file-I/O worker. Flet page
+        # patches are event-loop-affine: patching ``page.services`` from that
+        # worker updates Python state but can leave the native Audio service
+        # unmounted, with no loaded/state/error event ever arriving. Always
+        # marshal service replacement to the page loop.
         try:
-            self.page.run_task(self._watch_load, generation)
+            self.page.run_task(self._mount_source, source, generation)
         except Exception:
-            logger.debug(
-                "Audio load watcher skipped after session disposal", exc_info=True
+            logger.exception("Audio source could not be scheduled for mounting")
+            self._report_error("The audio player could not start loading this track.")
+
+    async def _mount_source(self, source: AudioSource, generation: int) -> None:
+        if self._closing or generation != self._generation:
+            return
+        previous = self.audio
+        try:
+            if previous is not None:
+                try:
+                    self.page.services.remove(previous)
+                except ValueError:
+                    pass
+
+            self.audio = fa.Audio(
+                src=source,
+                autoplay=False,
+                volume=self._volume,
+                release_mode=fa.ReleaseMode.STOP,
+                on_loaded=lambda _event: self._loaded_event(generation),
+                on_position_change=lambda event: self._position_changed(
+                    event, generation
+                ),
+                on_duration_change=lambda event: self._duration_changed(
+                    event, generation
+                ),
+                on_state_change=lambda event: self._state_changed(event, generation),
             )
+            self.page.services.append(self.audio)
+            self.page.update()
+            self._load_watchdog = self.page.run_task(self._watch_load, generation)
+        except Exception:
+            logger.exception("Audio source could not be mounted")
+            if generation != self._generation or self._closing:
+                return
+            self._loaded = False
+            self._cancel_load_watchdog()
+            self._pending_play_position = None
+            self._pending_seek_position = None
+            if self.audio is not None:
+                try:
+                    self.page.services.remove(self.audio)
+                except ValueError:
+                    pass
+                self.audio = None
+            if self.on_playing:
+                self.on_playing(False)
+            self._report_error("The audio player could not load this track.")
 
     def play(self, position_ms: int = 0) -> None:
         position = max(0, int(position_ms))
@@ -200,6 +236,7 @@ class FletAudioBackend:
         self._closing = True
         self._generation += 1
         self._media_generation += 1
+        self._cancel_load_watchdog()
         self._pending_play_position = None
         self._pending_seek_position = None
 
@@ -209,7 +246,6 @@ class FletAudioBackend:
             return
         self.audio.volume = self._volume
         try:
-            from typing import cast
             self.page.update(cast(ft.Control, self.audio))
         except Exception:
             logger.debug(
@@ -220,6 +256,7 @@ class FletAudioBackend:
         if generation != self._generation or self._closing or self.audio is None:
             return
         self._loaded = True
+        self._cancel_load_watchdog()
         pending_play = self._pending_play_position
         pending_seek = self._pending_seek_position
         self._pending_play_position = None
@@ -240,8 +277,10 @@ class FletAudioBackend:
         try:
             self.page.run_task(self._run_operation, operation, args, generation)
         except Exception:
-            logger.debug(
-                "Audio operation skipped after session disposal", exc_info=True
+            logger.exception("Audio operation could not be scheduled")
+            self._report_error(
+                "The audio player did not respond. The playback service may "
+                "have disconnected."
             )
 
     async def _run_operation(
@@ -259,14 +298,17 @@ class FletAudioBackend:
                 await asyncio.wait_for(
                     operation(*args), timeout=self._OPERATION_TIMEOUT_SECONDS
                 )
-        except (TimeoutError, RuntimeError, OSError) as error:
-            logger.warning("Audio operation failed: %s", error)
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            # This coroutine is the final boundary around Flet/native RPCs.
+            # Extension and method-channel failures are not restricted to the
+            # built-in timeout/OSError hierarchy.
+            logger.exception("Audio operation failed")
             self._report_error(
                 "The audio player did not respond. The track may be unsupported or "
                 "the playback service may have disconnected."
             )
-        except asyncio.CancelledError:
-            return
 
     async def _watch_load(self, generation: int) -> None:
         await asyncio.sleep(self._OPERATION_TIMEOUT_SECONDS)
@@ -278,6 +320,12 @@ class FletAudioBackend:
                 "corrupted or encoded in an unsupported format."
             )
 
+    def _cancel_load_watchdog(self) -> None:
+        watchdog = self._load_watchdog
+        self._load_watchdog = None
+        if watchdog is not None:
+            watchdog.cancel()
+
     async def _run_media_sync(
         self, generation: int, payload: dict[str, object]
     ) -> None:
@@ -288,7 +336,6 @@ class FletAudioBackend:
                 if self._closing or generation != self._media_generation:
                     return
                 if payload["title"]:
-                    from typing import cast
                     await asyncio.wait_for(
                         self.media_session.sync(**cast(Any, payload)),
                         timeout=self._OPERATION_TIMEOUT_SECONDS,
@@ -308,12 +355,10 @@ class FletAudioBackend:
             return
 
     def _report_error(self, message: str) -> None:
-        # A queued burst of obsolete seeks should produce one actionable error,
-        # not a stack-trace or notification storm.
-        now = time.monotonic()
-        if now - self._last_error_at < 5:
-            return
-        self._last_error_at = now
+        # Every failure must reach the controller so its optimistic loaded and
+        # playing flags can be repaired. User-notification coalescing belongs
+        # above this transport boundary; suppressing this callback used to
+        # leave a second failed source falsely marked as playable.
         if self.on_error:
             self.on_error(message)
 

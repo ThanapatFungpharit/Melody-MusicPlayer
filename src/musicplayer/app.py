@@ -103,6 +103,8 @@ class MusicPlayerApp(
             max_pending=2,
             thread_name_prefix="melody-io",
         )
+        self._system_media_key: tuple[str, ...] | None = None
+        self._system_media_metadata = ("", "", "", "")
         self.file_picker = ft.FilePicker()
         page.services.append(self.file_picker)
         self.backend = FletAudioBackend(page)
@@ -120,7 +122,7 @@ class MusicPlayerApp(
             on_duration=self.playback.on_duration,
             on_playing=self.playback.on_playing,
             on_completed=self.playback.on_completed,
-            on_error=self._show_error,
+            on_error=self.playback.on_backend_error,
             on_media_action=self._media_action,
         )
         self.downloads = DownloadCoordinator(
@@ -179,7 +181,7 @@ class MusicPlayerApp(
 
     def _playback_changed(self, change: str = "state") -> None:
         if change != "volume":
-            self._sync_system_media()
+            self._sync_system_media(refresh_metadata=change != "progress")
         if change == "progress":
             self._refresh_player_progress()
             return
@@ -203,30 +205,49 @@ class MusicPlayerApp(
         if self.active_panel == "queue":
             self._refresh_context_panel()
 
-    def _sync_system_media(self) -> None:
+    def _sync_system_media(self, *, refresh_metadata: bool = True) -> None:
         """Keep native lock-screen/notification controls aligned with playback."""
-        title = ""
-        artist = ""
-        album = ""
-        artwork_uri = ""
         if self.playback.external_title:
-            title = self.playback.external_title
-            artist = self.playback.external_uploader
-            artwork_uri = self.playback.external_thumbnail
+            media_key = (
+                "stream",
+                self.playback.external_title,
+                self.playback.external_uploader,
+                self.playback.external_thumbnail,
+            )
         elif self.playback.current_track_id:
-            try:
-                track = self.manager.get_track(self.playback.current_track_id)
-                details = self.library.details(self.playback.current_track_id)
-            except (KeyError, OSError, ValueError):
-                logger.debug("Could not resolve system media metadata", exc_info=True)
-            else:
-                title = track.title or Path(track.filename).stem
-                artist = details.uploader
-                artwork_uri = details.thumbnail
-                # Melody does not currently persist album tags. The source name
-                # is still useful context in media panels without pretending it
-                # is an album title.
-                album = details.source_name
+            media_key = ("track", self.playback.current_track_id)
+        else:
+            media_key = None
+
+        if refresh_metadata or media_key != self._system_media_key:
+            title = ""
+            artist = ""
+            album = ""
+            artwork_uri = ""
+            if self.playback.external_title:
+                title = self.playback.external_title
+                artist = self.playback.external_uploader
+                artwork_uri = self.playback.external_thumbnail
+            elif self.playback.current_track_id:
+                try:
+                    track = self.manager.get_track(self.playback.current_track_id)
+                    details = self.library.details(self.playback.current_track_id)
+                except (KeyError, OSError, ValueError):
+                    logger.debug(
+                        "Could not resolve system media metadata", exc_info=True
+                    )
+                else:
+                    title = track.title or Path(track.filename).stem
+                    artist = details.uploader
+                    artwork_uri = details.thumbnail
+                    # Melody does not currently persist album tags. The source
+                    # name is still useful context in media panels without
+                    # pretending it is an album title.
+                    album = details.source_name
+            self._system_media_key = media_key
+            self._system_media_metadata = (title, artist, album, artwork_uri)
+        else:
+            title, artist, album, artwork_uri = self._system_media_metadata
 
         has_media = bool(title)
         self.backend.sync_media_session(

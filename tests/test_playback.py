@@ -56,6 +56,32 @@ class DeferredExecutor:
 
 
 class PlaybackControllerTests(unittest.TestCase):
+    def test_bulk_queue_updates_persist_and_notify_once(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            music = root / "music"
+            music.mkdir()
+            manager = MusicManager(root / "library.mmdb", music)
+            store = ApplicationStore(root / "state.json")
+            controller = PlaybackController(
+                manager, LibraryService(manager, store), store, FakeAudioBackend()
+            )
+            controller.queue.replace(["current"])
+
+            with (
+                patch.object(controller, "_persist") as persist,
+                patch.object(controller, "_notify") as notify,
+            ):
+                controller.add_next_many(("next-one", "next-two"))
+                controller.add_last_many(("last-one", "last-two"))
+
+            self.assertEqual(
+                controller.queue.items,
+                ["current", "next-one", "next-two", "last-one", "last-two"],
+            )
+            self.assertEqual(persist.call_count, 2)
+            self.assertEqual(notify.call_count, 2)
+
     def test_audio_file_read_is_deferred_to_the_io_executor(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -383,6 +409,38 @@ class PlaybackControllerTests(unittest.TestCase):
             controller.on_position(500)
 
             self.assertEqual(changes, ["progress"])
+
+    def test_backend_failure_repairs_loaded_state_and_next_toggle_reloads(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            music = root / "music"
+            music.mkdir()
+            path = music / "song.mp3"
+            path.write_bytes(b"audio")
+            manager = MusicManager(root / "library.mmdb", music)
+            track_id = manager.add_track(path, title="Song")
+            store = ApplicationStore(root / "state.json")
+            backend = FakeAudioBackend()
+            errors: list[str] = []
+            controller = PlaybackController(
+                manager,
+                LibraryService(manager, store),
+                store,
+                backend,
+                on_error=errors.append,
+            )
+            controller.play_track(str(track_id))
+
+            controller.on_backend_error("native load failed")
+
+            self.assertFalse(controller.playing)
+            self.assertFalse(controller._source_loaded)
+            self.assertEqual(errors, ["native load failed"])
+            self.assertEqual(store.track_details(str(track_id)).play_count, 0)
+            controller.toggle()
+            self.assertEqual(backend.played_at, [0, 0])
+            controller.on_playing(True)
+            self.assertEqual(store.track_details(str(track_id)).play_count, 1)
 
 
 if __name__ == "__main__":

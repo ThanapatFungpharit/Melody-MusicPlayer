@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Sequence
 from concurrent.futures import CancelledError, Future
 from pathlib import Path
 from threading import RLock
@@ -57,22 +57,22 @@ class PlaybackController:
         self.queue = PlaybackQueue.from_dict(persisted)
         original_items = list(self.queue.items)
         original_index = self.queue.current_index
-        
-        new_items = []
+
+        available_items: list[str] = []
         items_before_original = 0
         current_was_available = False
 
-        for i, item in enumerate(original_items):
-            is_avail = self.manager.has_track(item)
-            if is_avail:
-                new_items.append(item)
-                if i < original_index:
+        for index, item in enumerate(original_items):
+            is_available = self.manager.has_track(item)
+            if is_available:
+                available_items.append(item)
+                if index < original_index:
                     items_before_original += 1
-            if i == original_index:
-                current_was_available = is_avail
+            if index == original_index:
+                current_was_available = is_available
 
-        self.queue.items = new_items
-        
+        self.queue.items = available_items
+
         if not self.queue.items:
             self.queue.current_index = -1
         elif current_was_available:
@@ -100,6 +100,8 @@ class PlaybackController:
         self._load_autoplay = False
         self._load_position = 0
         self._last_persisted_position = 0.0
+        self._last_backend_error_at: float | None = None
+        self._pending_play_record_id: str | None = None
         self.backend.set_volume(0.0 if self.muted else self.volume / 100)
         if self.queue.items != original_items:
             self._persist()
@@ -108,27 +110,26 @@ class PlaybackController:
     def current_track_id(self) -> str | None:
         return self.queue.current
 
-    def play_tracks(self, track_ids: list[str], *, start_index: int = 0) -> None:
-        requested = []
-        available = []
-        for item in track_ids:
-            item_str = str(item)
-            requested.append(item_str)
-            if self.manager.has_track(item_str):
-                available.append(item_str)
-        
+    def play_tracks(self, track_ids: Sequence[str], *, start_index: int = 0) -> None:
         selected_index = (
-            max(0, min(start_index, len(requested) - 1)) if requested else -1
+            max(0, min(start_index, len(track_ids) - 1)) if track_ids else -1
         )
-        selected = requested[selected_index] if selected_index >= 0 else None
+        selected = str(track_ids[selected_index]) if selected_index >= 0 else None
+        available: list[str] = []
+        available_index: int | None = None
+        for item in track_ids:
+            normalized = str(item)
+            if not self.manager.has_track(normalized):
+                continue
+            if available_index is None and normalized == selected:
+                available_index = len(available)
+            available.append(normalized)
+
         if not available:
             self._error("There are no available tracks to play.")
             return
-        available_index = (
-            available.index(selected)
-            if selected in available
-            else min(max(0, selected_index), len(available) - 1)
-        )
+        if available_index is None:
+            available_index = min(max(0, selected_index), len(available) - 1)
         self.queue.replace(available, start_index=available_index)
         self._load_current(autoplay=True)
 
@@ -155,9 +156,9 @@ class PlaybackController:
 
     def play_track(self, track_id: str) -> None:
         track_id = str(track_id)
-        if track_id in self.queue.items:
+        try:
             self.queue.current_index = self.queue.items.index(track_id)
-        else:
+        except ValueError:
             self.queue.replace([track_id])
         self._load_current(autoplay=True)
 
@@ -165,7 +166,8 @@ class PlaybackController:
         if not self.current_track_id and not self.external_title:
             tracks = self.manager.list_tracks()
             if tracks:
-                self.play_tracks([str(item.id) for item in tracks])
+                self.queue.replace([str(item.id) for item in tracks])
+                self._load_current(autoplay=True)
             else:
                 self._error("Your library is empty. Download a track first.")
             return
@@ -248,6 +250,26 @@ class PlaybackController:
         self.queue.add_last(track_id)
         self._persist()
         self._notify()
+
+    def add_next_many(self, track_ids: Iterable[str]) -> int:
+        """Insert several tracks next with one persistence/UI update cycle."""
+        items = [str(track_id) for track_id in track_ids]
+        for track_id in reversed(items):
+            self.queue.add_next(track_id)
+        if items:
+            self._persist()
+            self._notify()
+        return len(items)
+
+    def add_last_many(self, track_ids: Iterable[str]) -> int:
+        """Append several tracks with one persistence/UI update cycle."""
+        items = [str(track_id) for track_id in track_ids]
+        for track_id in items:
+            self.queue.add_last(track_id)
+        if items:
+            self._persist()
+            self._notify()
+        return len(items)
 
     def remove_queue_item(self, index: int) -> None:
         was_current = index == self.queue.current_index
@@ -375,10 +397,37 @@ class PlaybackController:
 
     def on_playing(self, playing: bool) -> None:
         self.playing = playing
+        track_id = self.current_track_id
+        if (
+            playing
+            and track_id is not None
+            and track_id == self._pending_play_record_id
+        ):
+            self._pending_play_record_id = None
+            self.library.record_play(
+                track_id,
+                playback=self.queue.to_dict(position_ms=self.position_ms),
+            )
         self._notify()
 
     def on_completed(self) -> None:
         self.next(automatic=True)
+
+    def on_backend_error(self, message: str) -> None:
+        """Reconcile optimistic controller state after a native audio failure."""
+        self.playing = False
+        self._source_loaded = False
+        self._loading = False
+        self._pending_play_record_id = None
+        self._persist()
+        self._notify()
+        now = time.monotonic()
+        if (
+            self._last_backend_error_at is None
+            or now - self._last_backend_error_at >= 5
+        ):
+            self._last_backend_error_at = now
+            self._error(message)
 
     def _load_current(self, *, autoplay: bool, position_ms: int = 0) -> bool:
         track_id = self.current_track_id
@@ -501,11 +550,11 @@ class PlaybackController:
         self.duration_ms = 0
         self.playing = autoplay
         if autoplay:
+            self._pending_play_record_id = track_id
             self.backend.play(position_ms)
-        self.library.record_play(
-            track_id,
-            playback=self.queue.to_dict(position_ms=position_ms),
-        )
+        else:
+            self._pending_play_record_id = None
+        self._persist()
 
     def _save_volume(self) -> None:
         settings = self.store.settings
@@ -527,6 +576,7 @@ class PlaybackController:
             future = self._load_future
             self._load_future = None
             self._loading = False
+            self._pending_play_record_id = None
         if future is not None:
             future.cancel()
 
@@ -550,4 +600,7 @@ def _audio_source(path: Path) -> bytes:
     plugin and can leave its method channel waiting indefinitely. Raw bytes are
     portable and also work for filenames containing spaces or non-ASCII text.
     """
-    return path.read_bytes()
+    source = path.read_bytes()
+    if not source:
+        raise ValueError("Audio file is empty")
+    return source

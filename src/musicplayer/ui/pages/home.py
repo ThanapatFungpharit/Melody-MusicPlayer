@@ -28,14 +28,21 @@ class HomePage(_Base):
     def _home_view(self) -> ft.Control:
         tracks = self.manager.list_tracks()
         recent_ids = self.store.get("recent_tracks", [])
-        recent = [
-            self.manager.get_track(item)
-            for item in recent_ids
-            if self.manager.has_track(item)
-        ][:6]
-        favorites = [
-            track for track in tracks if self.library.details(track.id).favorite
-        ][:6]
+        recent: list[Track] = []
+        for track_id in recent_ids:
+            try:
+                recent.append(self.manager.get_track(track_id))
+            except (KeyError, TypeError, ValueError):
+                continue
+            if len(recent) == 6:
+                break
+        favorite_ids = self.store.favorite_track_ids()
+        favorites: list[Track] = []
+        for track in tracks:
+            if str(track.id) in favorite_ids:
+                favorites.append(track)
+                if len(favorites) == 6:
+                    break
         greeting = _time_greeting()
         heading = ft.Column(
             [
@@ -139,7 +146,7 @@ class HomePage(_Base):
         )
         if not tracks:
             return [heading, _empty_state(ft.Icons.MUSIC_NOTE_ROUNDED, empty)]
-        compact = self._is_compact()
+        compact = self.compact_layout
         cards = [self._track_card(track) for track in tracks]
         if compact:
             # On mobile, wrap cards so they reflow within the viewport.
@@ -163,7 +170,7 @@ class HomePage(_Base):
 
     def _track_card(self, track: Track) -> ft.Control:
         details = self.library.details(track.id)
-        compact = self._is_compact()
+        compact = self.compact_layout
         accent = self._accent_hex()
         art_size = 110 if compact else 142
         return ft.Container(
@@ -212,7 +219,9 @@ class HomePage(_Base):
             border=ft.Border.all(1, ft.Colors.OUTLINE_VARIANT),
             on_click=lambda _, item=str(track.id): self.playback.play_track(item),
             on_hover=None if compact else self._card_hover,
-            animate_scale=None if compact else ft.Animation(150, ft.AnimationCurve.EASE_OUT),
+            animate_scale=None
+            if compact
+            else ft.Animation(150, ft.AnimationCurve.EASE_OUT),
             scale=1,
         )
 

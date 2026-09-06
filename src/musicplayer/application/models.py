@@ -19,13 +19,13 @@ class AppSettings:
     download_directory: str = field(
         default_factory=lambda: str(default_music_directory())
     )
-    volume: int = 72
-    previous_volume: int = 72
+    volume: int = 5
+    previous_volume: int = 5
     muted: bool = False
     theme: str = "dark"
     audio_format: str = "mp3"
     audio_quality: str = "best"
-    concurrent_downloads: int = 3
+    concurrent_downloads: int = 4
     cookie_file: str = ""
     resume_session: bool = True
     notifications: bool = True
@@ -125,6 +125,7 @@ class DownloadRecord:
             for name in cls.__dataclass_fields__
         }
         values["uploader"] = data.get("uploader", data.get("artist", ""))
+        values["track_ids"] = list(values["track_ids"] or [])
         return cls(**values)
 
     def to_dict(self) -> dict[str, Any]:

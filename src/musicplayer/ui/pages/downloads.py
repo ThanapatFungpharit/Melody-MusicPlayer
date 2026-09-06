@@ -26,15 +26,18 @@ class DownloadsPage(_Base):
     def _downloads_view(self) -> ft.Control:
         records = self.downloads.list()
         batch_groups: dict[str, list[DownloadRecord]] = {}
+        active = 0
+        completed = 0
+        issues = 0
         for record in records:
             if record.batch_id:
                 batch_groups.setdefault(record.batch_id, []).append(record)
-        active = sum(
-            record.status in {"queued", "downloading", "processing"}
-            for record in records
-        )
-        completed = sum(record.status == "completed" for record in records)
-        issues = sum(record.status in {"failed", "cancelled"} for record in records)
+            if record.status in {"queued", "downloading", "processing"}:
+                active += 1
+            elif record.status == "completed":
+                completed += 1
+            elif record.status in {"failed", "cancelled"}:
+                issues += 1
         finished = completed + issues
         summary = self._responsive_grid(
             [
@@ -142,10 +145,14 @@ class DownloadsPage(_Base):
         )
 
     def _batch_overview(self, records: list[DownloadRecord]) -> ft.Control:
-        ordered = sorted(records, key=lambda item: item.batch_position)
-        total = ordered[0].batch_size or len(ordered)
-        completed = sum(item.status == "completed" for item in ordered)
-        failed = sum(item.status in {"failed", "cancelled"} for item in ordered)
+        total = records[0].batch_size or len(records)
+        completed = 0
+        failed = 0
+        for record in records:
+            if record.status == "completed":
+                completed += 1
+            elif record.status in {"failed", "cancelled"}:
+                failed += 1
         finished = completed + failed
         active = total - finished
         status = (
@@ -302,7 +309,7 @@ class DownloadsPage(_Base):
             spacing=4,
             expand=True,
         )
-        compact = self._is_compact()
+        compact = self.compact_layout
         header: ft.Control
         if compact:
             header = ft.Column(

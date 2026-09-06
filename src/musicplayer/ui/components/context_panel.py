@@ -91,12 +91,15 @@ class ContextPanel(_Base):
     def _refresh_context_panel(self) -> None:
         if not self.context_sheet or not self.active_panel:
             return
-        builders = {
-            "queue": self._queue_view,
-            "downloads": self._downloads_view,
-            "settings": self._settings_view,
-        }
-        self.context_panel_body.content = builders[self.active_panel]()
+        if self.active_panel == "queue":
+            content = self._queue_view()
+        elif self.active_panel == "downloads":
+            content = self._downloads_view()
+        elif self.active_panel == "settings":
+            content = self._settings_view()
+        else:
+            return
+        self.context_panel_body.content = content
         try:
             self.page.update(self.context_panel_body)
         except Exception:
@@ -105,10 +108,7 @@ class ContextPanel(_Base):
     def _refresh_download_badge(self) -> None:
         if not hasattr(self, "download_button"):
             return
-        active = sum(
-            record.status in {"queued", "downloading", "processing"}
-            for record in self.downloads.list()
-        )
+        active = self.downloads.active_count()
         self.download_button.badge = str(active) if active else None
         self.download_button.tooltip = (
             f"Downloads — {active} active (Ctrl+D)" if active else "Downloads (Ctrl+D)"

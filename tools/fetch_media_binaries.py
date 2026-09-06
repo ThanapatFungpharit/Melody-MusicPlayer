@@ -105,7 +105,6 @@ ARCHIVES: dict[tuple[str, str], Archive] = {
         license="GPL-3.0-or-later",
         source_code="https://github.com/rhythmcache/ffmpeg-android/tree/0f21485",
     ),
-
 }
 
 
@@ -116,7 +115,12 @@ def fetch_bundle(
     binary_root: Path = DEFAULT_BINARY_ROOT,
 ) -> Path:
     """Download, verify, and extract a single target bundle."""
-    archive = ARCHIVES[(platform_name, architecture)]
+    try:
+        archive = ARCHIVES[(platform_name, architecture)]
+    except KeyError:
+        raise ValueError(
+            f"No supported media bundle for {platform_name}/{architecture}"
+        ) from None
     target = binary_root / platform_name / architecture
     suffix = ".exe" if platform_name == "windows" else ""
     expected = (target / f"ffmpeg{suffix}", target / f"ffprobe{suffix}")
@@ -272,8 +276,8 @@ def main() -> None:
         if arguments.architecture == "all"
         else (arguments.architecture,)
     )
-    for platform_name in platforms:
-        for architecture in architectures:
+    for platform_name, architecture in ARCHIVES:
+        if platform_name in platforms and architecture in architectures:
             fetch_bundle(platform_name, architecture, binary_root=arguments.output)
 
 

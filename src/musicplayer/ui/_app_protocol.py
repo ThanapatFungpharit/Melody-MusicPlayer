@@ -21,11 +21,11 @@ import flet as ft
 
 if TYPE_CHECKING:
     from musicplayer.application.downloads import DownloadCoordinator
+    from musicplayer.application.library_service import LibraryService
     from musicplayer.application.models import AppSettings
     from musicplayer.application.playback import PlaybackController
     from musicplayer.application.providers import ProviderRegistry
     from musicplayer.application.store import ApplicationStore
-    from musicplayer.application.library_service import LibraryService
     from musicplayer.core.concurrency import LazyBoundedExecutor
     from musicplayer.core.library import MusicManager
 
@@ -144,6 +144,7 @@ class AppProtocol(Protocol):
     def _refresh_player(self) -> None: ...
     def _refresh_player_progress(self) -> None: ...
     def _refresh_player_volume(self) -> None: ...
+    def _sync_system_media(self, *, refresh_metadata: bool = ...) -> None: ...
     def _set_player_progress(self) -> None: ...
     def _set_player_volume(self) -> None: ...
 

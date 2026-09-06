@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from threading import Event
+from typing import cast
 from unittest.mock import patch
 from uuid import UUID
 
@@ -14,7 +15,12 @@ from musicplayer.application.downloads import (
     _friendly_download_error,
     extract_download_urls,
 )
-from musicplayer.application.models import AppSettings, DownloadRecord, TrackDetails
+from musicplayer.application.models import (
+    AppSettings,
+    DownloadRecord,
+    SearchResult,
+    TrackDetails,
+)
 from musicplayer.application.store import ApplicationStore
 from musicplayer.core.concurrency import WorkerQueueFull
 from musicplayer.core.downloader import (
@@ -25,12 +31,18 @@ from musicplayer.core.downloader import (
     DownloadTask,
 )
 from musicplayer.core.library import MusicManager
+from musicplayer.core.library.utils import source_key
 from musicplayer.platform_runtime import current_architecture, current_platform
 
 
 class StubDownloader(Downloader):
     def _run_yt_dlp(self, job, temporary_directory: str) -> None:
         Path(temporary_directory, "downloaded.mp3").write_bytes(b"audio")
+
+
+class EmptyDownloader(Downloader):
+    def _run_yt_dlp(self, job, temporary_directory: str) -> None:
+        Path(temporary_directory, "downloaded.mp3").write_bytes(b"")
 
 
 class _DownloadStore:
@@ -136,6 +148,26 @@ class DownloaderTests(unittest.TestCase):
             self.assertEqual(len(result.files), 1)  # ty: ignore[unresolved-attribute]
             self.assertTrue(result.files[0].exists())  # ty: ignore[unresolved-attribute]
 
+    def test_empty_audio_output_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            downloader = EmptyDownloader(directory, max_workers=1)
+            task = downloader.start("https://example.test/empty")
+            job = downloader._jobs[task.id]
+            job.future.result(timeout=3)  # ty: ignore[unresolved-attribute]
+            result = downloader.result(task)
+            downloader.shutdown()
+
+            self.assertEqual(result.status, DownloadStatus.FAILED)  # ty: ignore[unresolved-attribute]
+            self.assertIn("empty audio file", result.error)  # ty: ignore[unresolved-attribute]
+
+    def test_failed_cleanup_does_not_mask_a_terminal_download_result(self) -> None:
+        output = Path("locked-output.mp3")
+        with (
+            patch.object(Path, "unlink", side_effect=PermissionError("locked")),
+            self.assertLogs("musicplayer.core.downloader", level="WARNING"),
+        ):
+            Downloader._remove_files((output,))
+
     def test_core_downloader_always_uses_bundled_media_tools(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             downloader = Downloader(directory, max_workers=1)
@@ -148,6 +180,87 @@ class DownloaderTests(unittest.TestCase):
 
 
 class BatchDownloadTests(unittest.TestCase):
+    def test_known_source_blocks_only_when_its_managed_file_is_intact(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            music = root / "music"
+            music.mkdir()
+            path = music / "known.mp3"
+            path.write_bytes(b"audio")
+            source = "https://youtu.be/known-source"
+            manager = MusicManager(root / "library.mmdb", music)
+            manager.add_track(path, source=source)
+            store = ApplicationStore(root / "state.json")
+            settings = AppSettings(download_directory=str(music))
+            result = SearchResult(
+                id="known-source",
+                title="Known",
+                uploader="Uploader",
+                duration=1,
+                thumbnail="",
+                url=source,
+                source="YouTube",
+            )
+            with patch("musicplayer.application.downloads.Downloader") as downloader:
+                coordinator = DownloadCoordinator(manager, store, settings)
+                with self.assertRaisesRegex(DuplicateDownloadError, "library"):
+                    coordinator.start(result)
+
+                path.unlink()
+                task = DownloadTask(UUID(int=1))
+                downloader.return_value.start.return_value = task
+                self.assertEqual(coordinator.start(result), task)
+
+    def test_redownload_repairs_broken_source_record_without_losing_identity(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            music = root / "music"
+            music.mkdir()
+            existing_path = music / "old.mp3"
+            existing_path.write_bytes(b"original audio")
+            replacement_path = music / "redownloaded.mp3"
+            replacement_path.write_bytes(b"fresh audio")
+            manager = MusicManager(root / "library.mmdb", music)
+            source = "https://youtu.be/repair-source"
+            existing_id = manager.add_track(existing_path, source=source)
+            playlist_id = manager.create_playlist("Kept")
+            manager.add_to_playlist(playlist_id, existing_id)
+            store = ApplicationStore(root / "state.json")
+            store.save_track_details(str(existing_id), TrackDetails(favorite=True))
+            existing_path.write_bytes(b"modified and no longer trusted")
+            task = DownloadTask(UUID(int=1))
+            result = DownloadResult(
+                task,
+                source,
+                DownloadStatus.COMPLETED,
+                (replacement_path,),
+            )
+            with patch("musicplayer.application.downloads.Downloader"):
+                coordinator = DownloadCoordinator(
+                    manager,
+                    store,
+                    AppSettings(download_directory=str(music)),
+                )
+
+            coordinator._handle_complete(
+                result,
+                {"url": source, "title": "Replacement", "source": "YouTube"},
+            )
+
+            record = coordinator.list()[0]
+            self.assertEqual(record.status, "completed")
+            self.assertEqual(record.track_ids, [str(existing_id)])
+            self.assertEqual(record.filename, replacement_path.name)
+            self.assertEqual(manager.track_path(existing_id), replacement_path)
+            self.assertIsNone(manager.check_track_integrity(existing_id))
+            self.assertEqual(
+                manager.playlist_tracks(playlist_id)[0].id,
+                existing_id,
+            )
+            self.assertTrue(store.track_details(str(existing_id)).favorite)
+
     def test_completed_download_reuses_content_duplicate_and_removes_extra_file(
         self,
     ) -> None:
@@ -200,7 +313,7 @@ class BatchDownloadTests(unittest.TestCase):
             DownloadStatus.DOWNLOADING,
             progress=0.25,
         )
-        metadata = {
+        metadata: dict[str, object] = {
             "url": progress.url,
             "title": "Song",
             "source": "YouTube",
@@ -209,18 +322,94 @@ class BatchDownloadTests(unittest.TestCase):
             settings = AppSettings(download_directory=directory)
             with patch("musicplayer.application.downloads.Downloader"):
                 coordinator = DownloadCoordinator(
-                    _Manager(), store, settings, on_change=notifications.append  # ty: ignore[invalid-argument-type]
+                    cast(MusicManager, _Manager()),
+                    cast(ApplicationStore, store),
+                    settings,
+                    on_change=notifications.append,
                 )
             with patch(
                 "musicplayer.application.downloads.time.monotonic",
                 side_effect=(10.0, 10.1, 11.1),
             ):
-                coordinator._handle_progress(progress, metadata)  # ty: ignore[invalid-argument-type]
-                coordinator._handle_progress(progress, metadata)  # ty: ignore[invalid-argument-type]
-                coordinator._handle_progress(progress, metadata)  # ty: ignore[invalid-argument-type]
+                coordinator._handle_progress(progress, metadata)
+                coordinator._handle_progress(progress, metadata)
+                coordinator._handle_progress(progress, metadata)
 
         self.assertEqual(store.save_count, 2)
         self.assertEqual(len(notifications), 2)
+
+    def test_terminal_progress_remains_active_until_library_import_finishes(
+        self,
+    ) -> None:
+        store = _DownloadStore()
+        task = DownloadTask(UUID(int=1))
+        progress = DownloadProgress(
+            task,
+            "https://youtu.be/song",
+            DownloadStatus.COMPLETED,
+            progress=1.0,
+        )
+        metadata: dict[str, object] = {
+            "url": progress.url,
+            "title": "Song",
+            "source": "YouTube",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            settings = AppSettings(download_directory=directory)
+            with patch("musicplayer.application.downloads.Downloader"):
+                coordinator = DownloadCoordinator(
+                    cast(MusicManager, _Manager()),
+                    cast(ApplicationStore, store),
+                    settings,
+                )
+            coordinator._handle_progress(progress, metadata)
+
+        self.assertEqual(coordinator.list()[0].status, "processing")
+        self.assertEqual(coordinator.active_count(), 1)
+
+    def test_steady_progress_is_throttled_across_all_active_jobs(self) -> None:
+        store = _DownloadStore()
+        notifications: list[DownloadRecord] = []
+        first = DownloadProgress(
+            DownloadTask(UUID(int=1)),
+            "https://youtu.be/one",
+            DownloadStatus.DOWNLOADING,
+            progress=0.1,
+        )
+        second = DownloadProgress(
+            DownloadTask(UUID(int=2)),
+            "https://youtu.be/two",
+            DownloadStatus.DOWNLOADING,
+            progress=0.1,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            settings = AppSettings(download_directory=directory)
+            with patch("musicplayer.application.downloads.Downloader"):
+                coordinator = DownloadCoordinator(
+                    cast(MusicManager, _Manager()),
+                    cast(ApplicationStore, store),
+                    settings,
+                    on_change=notifications.append,
+                )
+            with patch(
+                "musicplayer.application.downloads.time.monotonic",
+                side_effect=(10.0, 10.0, 10.1, 10.1, 11.1, 11.1),
+            ):
+                for progress in (first, second, first, second, first, second):
+                    coordinator._handle_progress(
+                        progress,
+                        {
+                            "url": progress.url,
+                            "title": "Song",
+                            "source": "YouTube",
+                        },
+                    )
+
+        # Both initial status transitions are immediate. The four steady
+        # updates share one later persistence/notification allowance.
+        self.assertEqual(store.save_count, 3)
+        self.assertEqual(len(notifications), 3)
 
     def test_pasted_url_lists_are_extracted_and_deduplicated(self) -> None:
         urls = extract_download_urls(
@@ -352,6 +541,16 @@ class BatchDownloadTests(unittest.TestCase):
                         "https://www.youtube.com/watch?v=video-id"
                     )
                 )
+                with patch(
+                    "musicplayer.application.downloads.source_key",
+                    wraps=source_key,
+                ) as normalize:
+                    self.assertTrue(
+                        coordinator.is_source_active(
+                            "https://www.youtube.com/watch?v=video-id"
+                        )
+                    )
+                self.assertEqual(normalize.call_count, 1)
                 with self.assertRaisesRegex(DuplicateDownloadError, "downloading"):
                     coordinator.start_url("https://www.youtube.com/watch?v=video-id")
 

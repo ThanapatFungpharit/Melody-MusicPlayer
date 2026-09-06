@@ -27,9 +27,7 @@ class MediaBinaryError(RuntimeError):
 _PLATFORM_NAMES = {
     "win32": "windows",
     "windows": "windows",
-    "cygwin": "windows",
     "linux": "linux",
-    "linux2": "linux",
     "darwin": "macos",
     "macos": "macos",
     "android": "android",
@@ -44,10 +42,12 @@ _ARCHITECTURE_NAMES = {
     "armeabi-v7a": "arm",
     "armv7l": "arm",
     "arm": "arm",
-    "i686": "x86",
-    "i386": "x86",
-    "x86": "x86",
-    "riscv64": "riscv64",
+}
+_PLATFORM_ARCHITECTURES = {
+    "windows": frozenset({"x86_64", "arm64"}),
+    "linux": frozenset({"x86_64", "arm64"}),
+    "macos": frozenset({"x86_64", "arm64"}),
+    "android": frozenset({"x86_64", "arm64", "arm"}),
 }
 
 
@@ -94,7 +94,7 @@ def current_architecture(
     except KeyError:
         raise UnsupportedPlatformError(
             f"Unsupported architecture: {detected!r}. "
-            "Melody supports x86_64, arm64, arm (armeabi-v7a), x86, and riscv64."
+            "Melody supports x86_64, arm64, and Android arm (armeabi-v7a)."
         ) from None
 
 
@@ -138,6 +138,13 @@ def media_binary_bundle(
     environment = os.environ if environ is None else environ
     normalized_platform = current_platform(platform_name, environ=environment)
     normalized_architecture = current_architecture(architecture, environ=environment)
+    supported_architectures = _PLATFORM_ARCHITECTURES[normalized_platform]
+    if normalized_architecture not in supported_architectures:
+        supported = ", ".join(sorted(supported_architectures))
+        raise UnsupportedPlatformError(
+            f"Unsupported architecture {normalized_architecture!r} for "
+            f"{normalized_platform}. Supported architectures: {supported}."
+        )
 
     if normalized_platform == "android":
         native_directory = environment.get("ANDROID_NATIVE_LIBRARY_DIR")

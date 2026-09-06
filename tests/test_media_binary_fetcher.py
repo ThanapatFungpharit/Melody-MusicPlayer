@@ -6,11 +6,35 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from unittest import mock
 
-from tools.fetch_media_binaries import ARCHIVES, _extract_programs
+from tools.fetch_media_binaries import ARCHIVES, _extract_programs, fetch_bundle, main
 
 
 class MediaBinaryFetcherTests(unittest.TestCase):
+    def test_unsupported_platform_architecture_pair_fails_before_download(
+        self,
+    ) -> None:
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            self.assertRaisesRegex(ValueError, "linux/arm"),
+        ):
+            fetch_bundle("linux", "arm", binary_root=Path(directory))
+
+    def test_all_targets_iterates_only_available_platform_architectures(
+        self,
+    ) -> None:
+        with (
+            mock.patch("sys.argv", ["fetch_media_binaries.py"]),
+            mock.patch("tools.fetch_media_binaries.fetch_bundle") as fetch,
+        ):
+            main()
+
+        self.assertEqual(
+            [(call.args[0], call.args[1]) for call in fetch.call_args_list],
+            list(ARCHIVES),
+        )
+
     def test_windows_archives_include_yt_dlp_audio_encoders(self) -> None:
         for architecture in ("x86_64", "arm64"):
             archive = ARCHIVES[("windows", architecture)]

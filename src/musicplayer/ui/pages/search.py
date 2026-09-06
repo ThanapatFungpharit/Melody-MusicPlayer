@@ -11,6 +11,7 @@ from musicplayer.application.downloads import (
 )
 from musicplayer.application.models import SearchResult
 from musicplayer.application.providers import YOUTUBE_PROVIDER_ID, ProviderError
+from musicplayer.core.library.models import Playlist
 from musicplayer.ui.components.common import (
     _artwork,
     _empty_state,
@@ -348,9 +349,13 @@ class SearchPage(_Base):
                 )
             ]
         elif self.search_view_mode == "grid":
+            playlists = self.manager.list_playlists()
             self.search_list.controls = [
                 ft.Row(
-                    [self._search_result_card(item) for item in self.search_results],
+                    [
+                        self._search_result_card(item, playlists)
+                        for item in self.search_results
+                    ],
                     wrap=True,
                     spacing=14,
                     run_spacing=14,
@@ -358,8 +363,9 @@ class SearchPage(_Base):
                 )
             ]
         else:
+            playlists = self.manager.list_playlists()
             self.search_list.controls = [
-                self._search_result_row(item) for item in self.search_results
+                self._search_result_row(item, playlists) for item in self.search_results
             ]
         if update:
             self.page.update(self.search_list)
@@ -391,7 +397,9 @@ class SearchPage(_Base):
         self.search_previous_button.disabled = self.search_busy or self.search_page <= 1
         self.search_next_button.disabled = self.search_busy or not self.search_has_next
 
-    def _search_result_row(self, result: SearchResult) -> ft.Control:
+    def _search_result_row(
+        self, result: SearchResult, playlists: tuple[Playlist, ...]
+    ) -> ft.Control:
         subtitle = f"{result.uploader}  •  {result.source}"
         if result.is_playlist:
             subtitle += f"  •  {result.entry_count or 'Multiple'} tracks"
@@ -402,8 +410,8 @@ class SearchPage(_Base):
             if result.is_playlist
             else self.manager.find_track_by_source(result.url)
         )
-        menu_items = self._search_result_menu(result)
-        compact = self._is_compact()
+        menu_items = self._search_result_menu(result, playlists)
+        compact = self.compact_layout
         actions: list[ft.Control] = (
             [
                 ft.PopupMenuButton(
@@ -460,7 +468,9 @@ class SearchPage(_Base):
             padding=12,
         )
 
-    def _search_result_card(self, result: SearchResult) -> ft.Control:
+    def _search_result_card(
+        self, result: SearchResult, playlists: tuple[Playlist, ...]
+    ) -> ft.Control:
         local_track = (
             None
             if result.is_playlist
@@ -471,14 +481,16 @@ class SearchPage(_Base):
             detail += f" • {result.entry_count or 'Multiple'} tracks"
         elif result.duration:
             detail += f" • {_format_duration(result.duration)}"
-        compact = self._is_compact()
+        compact = self.compact_layout
         art_size = 150 if compact else 220
         card_width = 180 if compact else 260
         return ft.Container(
             card(
                 ft.Column(
                     [
-                        _artwork(result.thumbnail, art_size, playlist=result.is_playlist),
+                        _artwork(
+                            result.thumbnail, art_size, playlist=result.is_playlist
+                        ),
                         ft.Text(
                             result.title,
                             weight=ft.FontWeight.BOLD,
@@ -522,7 +534,9 @@ class SearchPage(_Base):
                                     icon=ft.Icons.MORE_HORIZ_ROUNDED,
                                     tooltip="More actions",
                                     items=self._search_result_menu(
-                                        result, include_primary_actions=False
+                                        result,
+                                        playlists,
+                                        include_primary_actions=False,
                                     ),
                                 ),
                             ]
@@ -536,11 +550,15 @@ class SearchPage(_Base):
         )
 
     def _search_result_menu(
-        self, result: SearchResult, *, include_primary_actions: bool | None = None
+        self,
+        result: SearchResult,
+        playlists: tuple[Playlist, ...],
+        *,
+        include_primary_actions: bool | None = None,
     ) -> list[ft.PopupMenuItem]:
         menu_items: list[ft.PopupMenuItem] = []
         show_primary_actions = (
-            self._is_compact()
+            self.compact_layout
             if include_primary_actions is None
             else include_primary_actions
         )
@@ -592,7 +610,7 @@ class SearchPage(_Base):
                     self._act_on_search_result(item, "playlist", pid)
                 ),
             )
-            for playlist in self.manager.list_playlists()
+            for playlist in playlists
         )
         menu_items.append(
             ft.PopupMenuItem(
@@ -623,10 +641,7 @@ class SearchPage(_Base):
         else:
             if after:
                 self.pending_download_actions[str(task.id)] = (after, playlist_id)
-                record = next(
-                    (item for item in self.downloads.list() if item.id == str(task.id)),
-                    None,
-                )
+                record = self.downloads.get(str(task.id))
                 if record and record.status in {"completed", "failed", "cancelled"}:
                     self._download_changed(record)
             noun = "playlist" if result.is_playlist else "track"
@@ -659,22 +674,17 @@ class SearchPage(_Base):
         if not available:
             return
         if action == "next":
-            for track_id in reversed(available):
-                self.playback.add_next(track_id)
+            self.playback.add_next_many(available)
             message = "Ready to play next."
         elif action == "queue":
-            for track_id in available:
-                self.playback.add_last(track_id)
+            self.playback.add_last_many(available)
             message = "Added to the queue."
         elif action == "playlist" and playlist_id:
-            for track_id in available:
-                self.manager.add_to_playlist(playlist_id, track_id)
+            self.manager.add_tracks_to_playlist(playlist_id, available)
             playlist = self.manager.get_playlist(playlist_id)
             message = f"Added to {playlist.name}."
         elif action == "favorite":
-            for track_id in available:
-                if not self.library.details(track_id).favorite:
-                    self.library.toggle_favorite(track_id)
+            self.library.favorite_tracks(available)
             message = "Added to favorites."
         elif action == "play":
             self.playback.play_tracks(available)

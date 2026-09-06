@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import unittest
+from types import SimpleNamespace
+from unittest.mock import Mock
 from uuid import UUID
 
 import flet as ft
@@ -60,6 +62,9 @@ class _Store:
     def get(self, _: str, default: object = None) -> object:
         return default
 
+    def favorite_track_ids(self) -> frozenset[str]:
+        return frozenset()
+
 
 class AppLayoutTests(unittest.TestCase):
     def _app(self) -> MusicPlayerApp:
@@ -67,6 +72,7 @@ class AppLayoutTests(unittest.TestCase):
         app.page = _Page()  # ty: ignore[invalid-assignment]
         app.settings = AppSettings()
         app.providers = _Providers()  # ty: ignore[invalid-assignment]
+        app.compact_layout = False
         return app
 
     def test_context_panel_dimensions_respond_to_window_size(self) -> None:
@@ -78,6 +84,42 @@ class AppLayoutTests(unittest.TestCase):
         self.assertEqual(app._context_panel_width(1040), 1040)
         self.assertEqual(app._context_panel_padding(1540).left, 40)
         self.assertEqual(app._context_panel_padding(800).left, 20)
+
+    def test_progress_media_sync_reuses_resolved_track_metadata(self) -> None:
+        app = self._app()
+        app.playback = SimpleNamespace(  # ty: ignore[invalid-assignment]
+            external_title="",
+            external_uploader="",
+            external_thumbnail="",
+            current_track_id="track",
+            duration_ms=3000,
+            position_ms=1000,
+            playing=True,
+            queue=SimpleNamespace(repeat=SimpleNamespace(value="none"), shuffle=False),
+        )
+        app.manager = Mock()
+        app.manager.get_track.return_value = SimpleNamespace(
+            title="Cached title", filename="cached.mp3"
+        )
+        app.library = Mock()
+        app.library.details.return_value = SimpleNamespace(
+            uploader="Artist", thumbnail="artwork", source_name="YouTube"
+        )
+        app.backend = Mock()
+        app._system_media_key = None
+        app._system_media_metadata = ("", "", "", "")
+
+        app._sync_system_media()
+        app.playback.position_ms = 2000
+        app._sync_system_media(refresh_metadata=False)
+
+        app.manager.get_track.assert_called_once_with("track")
+        app.library.details.assert_called_once_with("track")
+        self.assertEqual(app.backend.sync_media_session.call_count, 2)
+        self.assertEqual(
+            app.backend.sync_media_session.call_args_list[-1].kwargs["position_ms"],
+            2000,
+        )
 
     def test_shell_reserves_bottom_system_safe_area(self) -> None:
         app = self._app()

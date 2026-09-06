@@ -74,6 +74,7 @@ class PlaylistFeatureTests(unittest.TestCase):
         self.app.library = _Library()  # ty: ignore[invalid-assignment]
         self.app.downloads = _Downloads()  # ty: ignore[invalid-assignment]
         self.app.selected_navigation = 3
+        self.app.compact_layout = False
         self.app.navigate = Mock()
         self.app._show_message = Mock()
         self.app._show_error = Mock()
@@ -149,7 +150,7 @@ class PlaylistFeatureTests(unittest.TestCase):
         field.value = "https://www.youtube.com/watch?v=single-video"
         dialog.actions[-1].on_click(None)
 
-        self.assertEqual(field.error_text, "Paste a complete YouTube playlist URL.")
+        self.assertEqual(field.error, "Paste a complete YouTube playlist URL.")
         self.assertEqual(self.app.page.pop_count, 0)  # ty: ignore[unresolved-attribute]
 
     def test_playlist_import_reuses_local_tracks_and_downloads_only_missing(
@@ -246,7 +247,8 @@ class PlaylistFeatureTests(unittest.TestCase):
         self.assertIsNone(self.app.playlist_import_session)
         self.assertFalse(self.app.downloads.is_source_active(result.url))
         self.assertEqual(
-            self.app.downloads.cancelled, ["00000000-0000-0000-0000-000000000001"]  # ty: ignore[unresolved-attribute]
+            self.app.downloads.cancelled,  # ty: ignore[unresolved-attribute]
+            ["00000000-0000-0000-0000-000000000001"],
         )
         self.assertEqual(len(self.manager.list_tracks()), 0)
 

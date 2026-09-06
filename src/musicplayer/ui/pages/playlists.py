@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import random
 from collections import deque
 from dataclasses import dataclass, field
 from threading import RLock, Timer
@@ -136,7 +137,11 @@ class PlaylistsPage(_PlaylistBase):
 
     def _playlist_detail(self, playlist: Playlist) -> ft.Control:
         tracks = self.manager.playlist_tracks(playlist.id)
-        compact = self._is_compact()
+        track_ids = tuple(str(track.id) for track in tracks)
+        other_playlists = tuple(
+            item for item in self.manager.list_playlists() if item.id != playlist.id
+        )
+        compact = self.compact_layout
         bulk_add_button: ft.Control
         if compact:
             bulk_add_button = ft.IconButton(
@@ -164,7 +169,13 @@ class PlaylistsPage(_PlaylistBase):
         if tracks:
             rows = ft.ReorderableListView(
                 controls=[
-                    self._playlist_track_row(playlist, track, index, len(tracks))
+                    self._playlist_track_row(
+                        playlist,
+                        track,
+                        index,
+                        other_playlists,
+                        track_ids,
+                    )
                     for index, track in enumerate(tracks)
                 ],
                 spacing=6,
@@ -215,7 +226,7 @@ class PlaylistsPage(_PlaylistBase):
                         ft.IconButton(
                             ft.Icons.ADD_TO_QUEUE_ROUNDED,
                             tooltip="Add playlist to queue",
-                            on_click=lambda _: self._queue_collection(list(tracks)),
+                            on_click=lambda _: self._queue_collection(tracks),
                         ),
                         ft.PopupMenuButton(
                             icon=ft.Icons.MORE_HORIZ_ROUNDED,
@@ -247,15 +258,14 @@ class PlaylistsPage(_PlaylistBase):
         )
 
     def _playlist_track_row(
-        self, playlist: Playlist, track: Track, index: int, count: int
+        self,
+        playlist: Playlist,
+        track: Track,
+        index: int,
+        other_playlists: tuple[Playlist, ...],
+        playlist_track_ids: tuple[str, ...],
     ) -> ft.Control:
         details = self.library.details(track.id)
-        others = [
-            item for item in self.manager.list_playlists() if item.id != playlist.id
-        ]
-        playlist_track_ids = [
-            str(item.id) for item in self.manager.playlist_tracks(playlist.id)
-        ]
         menu: list[ft.PopupMenuItem] = [
             ft.PopupMenuItem(
                 content="Play next",
@@ -278,7 +288,7 @@ class PlaylistsPage(_PlaylistBase):
                 on_click=lambda _, item=track: self._track_details_dialog(item),
             ),
         ]
-        for target in others:
+        for target in other_playlists:
             menu.extend(
                 [
                     ft.PopupMenuItem(
@@ -310,7 +320,7 @@ class PlaylistsPage(_PlaylistBase):
                 ),
             )
         )
-        compact = self._is_compact()
+        compact = self.compact_layout
         leading: list[ft.Control] = []
         if not compact:
             leading.extend(
@@ -381,10 +391,8 @@ class PlaylistsPage(_PlaylistBase):
         self.navigate(3)
 
     def _play_playlist(self, playlist: Playlist, *, shuffle: bool = False) -> None:
-        ids = [str(track.id) for track in self.manager.playlist_tracks(playlist.id)]
+        ids = [str(track_id) for track_id in playlist.track_ids]
         if shuffle:
-            import random
-
             random.shuffle(ids)
         self.playback.play_tracks(ids)
 
@@ -422,7 +430,7 @@ class PlaylistsPage(_PlaylistBase):
             label="YouTube playlist URL",
             hint_text="https://www.youtube.com/playlist?list=…",
             autofocus=True,
-            width=None if self._is_compact() else 560,
+            width=None if self.compact_layout else 560,
         )
 
         def begin(_: Any) -> None:
@@ -671,17 +679,7 @@ class PlaylistsPage(_PlaylistBase):
         imported_order = [
             session.resolved[key] for key in session.order if key in session.resolved
         ]
-        self.manager.add_tracks_to_playlist(session.playlist_id, imported_order)
-        playlist = self.manager.get_playlist(session.playlist_id)
-        imported_ids = set(imported_order)
-        extras = [
-            str(track_id)
-            for track_id in playlist.track_ids
-            if str(track_id) not in imported_ids
-        ]
-        ordered = imported_order + extras
-        if ordered != [str(track_id) for track_id in playlist.track_ids]:
-            self.manager.reorder_playlist(session.playlist_id, ordered)
+        self.manager.merge_tracks_into_playlist(session.playlist_id, imported_order)
 
     def _finish_playlist_import(self, session: _PlaylistImportSession) -> None:
         if self.playlist_import_session is not session:
@@ -822,6 +820,7 @@ class PlaylistsPage(_PlaylistBase):
         track_list: ft.Control
         if checkboxes:
             from typing import cast
+
             track_list = ft.Column(
                 cast(list[ft.Control], checkboxes),
                 spacing=2,
@@ -857,7 +856,7 @@ class PlaylistsPage(_PlaylistBase):
                     ],
                     spacing=10,
                     tight=True,
-                    width=None if self._is_compact() else 560,
+                    width=None if self.compact_layout else 560,
                 ),
                 actions=[
                     ft.TextButton("Cancel", on_click=lambda _: self.page.pop_dialog()),

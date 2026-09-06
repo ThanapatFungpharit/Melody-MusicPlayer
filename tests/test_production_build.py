@@ -111,9 +111,7 @@ class ProductionBuildTests(unittest.TestCase):
             {"FLET_FORCE_WEB_SERVER": "1"},
             {"FLET_VIEW_PATH": "development-client"},
         ):
-            with self.subTest(environment=environment), self.assertRaises(
-                RuntimeError
-            ):
+            with self.subTest(environment=environment), self.assertRaises(RuntimeError):
                 production_build_environment(environment)
 
     def test_android_build_requires_release_signing(self) -> None:
@@ -275,9 +273,7 @@ class ProductionBuildTests(unittest.TestCase):
         release = json.dumps(EXPECTED_RELEASE_CONFIG).encode()
         artifact_contents = _zip_bytes(
             {
-                "assets/app.zip": _zip_bytes(
-                    {"musicplayer/release.json": release}
-                ),
+                "assets/app.zip": _zip_bytes({"musicplayer/release.json": release}),
                 "assets/stdlib.zip": _zip_bytes(
                     {"_remote_debugging.soref": b"lib_remote_debugging.so"}
                 ),

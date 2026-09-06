@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 import unittest
+from concurrent.futures import Future
 from types import SimpleNamespace
 from typing import Any
 
@@ -13,13 +15,16 @@ class FakePage:
     def __init__(self) -> None:
         self.services: list[Any] = []
         self.scheduled: list[tuple[Any, tuple[Any, ...]]] = []
+        self.futures: list[Future[Any]] = []
 
     def update(self, *_: Any) -> None:
         pass
 
-    def run_task(self, handler: Any, *args: Any) -> object:
+    def run_task(self, handler: Any, *args: Any) -> Future[Any]:
         self.scheduled.append((handler, args))
-        return object()
+        future: Future[Any] = Future()
+        self.futures.append(future)
+        return future
 
 
 class FletAudioBackendTests(unittest.TestCase):
@@ -30,21 +35,27 @@ class FletAudioBackendTests(unittest.TestCase):
         backend.load(b"audio bytes")
         backend.play(1250)
 
-        # Only the load watchdog is scheduled before the client confirms that
-        # its native audio player is ready.
+        # Service creation itself is marshalled to the page loop because a
+        # source may have become ready on a worker thread.
         self.assertEqual(len(page.scheduled), 1)
+        mount_handler, mount_args = page.scheduled[0]
+        asyncio.run(mount_handler(*mount_args))
+        # Mounting schedules the load watchdog; play remains pending until the
+        # native client confirms that its player is ready.
+        self.assertEqual(len(page.scheduled), 2)
         backend._loaded_event(1)
+        self.assertTrue(page.futures[1].cancelled())
         backend.pause()
         backend.resume()
         backend.seek(2500)
         backend.close()
 
-        self.assertEqual(len(page.scheduled), 5)
+        self.assertEqual(len(page.scheduled), 6)
         self.assertTrue(
             all(inspect.iscoroutinefunction(handler) for handler, _ in page.scheduled)
         )
-        play_operation = page.scheduled[1][1]
-        seek_operation = page.scheduled[4][1]
+        play_operation = page.scheduled[2][1]
+        seek_operation = page.scheduled[5][1]
         self.assertEqual(play_operation[1], (1250,))
         self.assertEqual(seek_operation[1], (2500,))
 
@@ -104,6 +115,23 @@ class FletAudioBackendTests(unittest.TestCase):
         backend._media_action(event)  # type: ignore[arg-type]  # ty: ignore[invalid-argument-type]
 
         self.assertEqual(received, [("seekTo", 42_000)])
+
+    def test_every_audio_failure_is_forwarded_for_state_repair(self) -> None:
+        page = FakePage()
+        backend = FletAudioBackend(page)  # type: ignore[arg-type]  # ty: ignore[invalid-argument-type]
+        errors: list[str] = []
+        backend.bind(
+            on_position=lambda _: None,
+            on_duration=lambda _: None,
+            on_playing=lambda _: None,
+            on_completed=lambda: None,
+            on_error=errors.append,
+        )
+
+        backend._report_error("first")
+        backend._report_error("second")
+
+        self.assertEqual(errors, ["first", "second"])
 
     def test_native_media_actions_map_to_idempotent_playback_commands(self) -> None:
         class FakePlayback:

@@ -26,9 +26,10 @@ class QueuePage(_Base):
     def _queue_view(self) -> ft.Control:
         queue_rows: list[ft.Control] = []
         for index, track_id in enumerate(self.playback.queue.items):
-            if not self.manager.has_track(track_id):
+            try:
+                track = self.manager.get_track(track_id)
+            except (KeyError, TypeError, ValueError):
                 continue
-            track = self.manager.get_track(track_id)
             details = self.library.details(track_id)
             current = index == self.playback.queue.current_index
             queue_rows.append(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import shutil
+import stat
 import tempfile
 from collections import deque
 from collections.abc import Callable
@@ -199,11 +200,15 @@ class Downloader:
         try:
             for source in temporary_directory.iterdir():
                 self._raise_if_cancelled(job)
-                if (
-                    not source.is_file()
-                    or source.suffix.casefold() not in self._audio_extensions
-                ):
+                if source.suffix.casefold() not in self._audio_extensions:
                     continue
+                file_status = source.stat()
+                if not stat.S_ISREG(file_status.st_mode):
+                    continue
+                if file_status.st_size <= 0:
+                    raise RuntimeError(
+                        f"The download produced an empty audio file: {source.name}"
+                    )
                 destination = self._reserve_destination(source.name)
                 try:
                     shutil.move(str(source), str(destination))
@@ -326,7 +331,16 @@ class Downloader:
     @staticmethod
     def _remove_files(files: tuple[Path, ...]) -> None:
         for path in files:
-            path.unlink(missing_ok=True)
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                # Cleanup is best-effort. A locked output must not prevent the
+                # task from publishing its real cancelled/failed outcome.
+                logger.warning(
+                    "Could not remove incomplete download output: path=%s",
+                    path,
+                    exc_info=True,
+                )
 
     @staticmethod
     def _raise_if_cancelled(job: _Job) -> None:

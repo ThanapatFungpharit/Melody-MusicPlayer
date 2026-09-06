@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import logging
 import os
+import stat
 import struct
 import tempfile
 import threading
 import time
+from collections.abc import Iterator, Sequence
 from dataclasses import replace
 from pathlib import Path
-from collections.abc import Sequence
 from uuid import UUID, uuid4
 
 from .config import HEADER, MAGIC, SHA256_BYTES, TRACK_FIXED, U32, UUID_ONLY, VERSION
@@ -65,29 +66,23 @@ class MusicManager:
     def _load(self) -> None:
         logger.debug("Loading music metadata: path=%s", self.metadata_path)
         try:
-            exists = self.metadata_path.exists()
-            size = self.metadata_path.stat().st_size if exists else 0
-        except OSError:
-            logger.exception(
-                "Unable to inspect music metadata file: path=%s", self.metadata_path
-            )
-            raise
-        if not exists or size == 0:
+            data = self.metadata_path.read_bytes()
+        except FileNotFoundError:
             logger.info(
-                "No existing music metadata to load: path=%s exists=%s size=%d",
-                self.metadata_path,
-                exists,
-                size,
+                "No existing music metadata to load: path=%s", self.metadata_path
             )
             return
-
-        try:
-            data = self.metadata_path.read_bytes()
         except OSError:
             logger.exception(
                 "Failed to read music metadata file: path=%s", self.metadata_path
             )
             raise
+        if not data:
+            logger.info(
+                "No existing music metadata to load: path=%s (empty file)",
+                self.metadata_path,
+            )
+            return
         logger.debug(
             "Read music metadata: path=%s byte_count=%d", self.metadata_path, len(data)
         )
@@ -381,12 +376,18 @@ class MusicManager:
             "add_track entered: filename=%s source=%s title=%r", filename, source, title
         )
         relative_filename = self._relative_filename(filename)
-        path = self._path_for_filename(relative_filename)
-        if not path.is_file():
+        path = self._music_folder / relative_filename
+        try:
+            file_status = path.stat()
+        except OSError:
             logger.error(
                 "Cannot add track because its file does not exist: path=%s", path
             )
             raise FileNotFoundError(path)
+        if not stat.S_ISREG(file_status.st_mode):
+            raise FileNotFoundError(path)
+        if file_status.st_size <= 0:
+            raise ValueError("Track file is empty")
         digest = _sha256(path)
         track_title = title.strip()
 
@@ -395,10 +396,17 @@ class MusicManager:
             track = Track(
                 track_id, relative_filename, source, track_title, time.time(), digest
             )
+            previous_newest_track_ids = self._newest_track_ids
             self._tracks[track_id] = track
             self._index_track(track)
             self._newest_track_ids = None
-            self._save()
+            try:
+                self._save()
+            except Exception:
+                self._tracks.pop(track_id, None)
+                self._unindex_track(track)
+                self._newest_track_ids = previous_newest_track_ids
+                raise
             logger.info(
                 "Track added: track_id=%s filename=%s source=%s title=%r",
                 track_id,
@@ -407,6 +415,50 @@ class MusicManager:
                 track_title,
             )
             return track_id
+
+    def replace_track_file(self, track_id: UUID | str, filename: str | Path) -> None:
+        """Point an existing track at a verified replacement file.
+
+        The track identity and playlist membership remain unchanged. This is
+        used when a new download repairs a missing, unreadable, or modified
+        managed file for an already-known source.
+        """
+        relative_filename = self._relative_filename(filename)
+        path = self._music_folder / relative_filename
+        try:
+            file_status = path.stat()
+        except OSError:
+            raise FileNotFoundError(path)
+        if not stat.S_ISREG(file_status.st_mode):
+            raise FileNotFoundError(path)
+        if file_status.st_size <= 0:
+            raise ValueError("Track file is empty")
+        digest = _sha256(path)
+
+        with self._lock:
+            track = self._get_track(track_id)
+            previous_filename = track.filename
+            previous_hash = track.content_hash
+            if previous_filename == relative_filename and previous_hash == digest:
+                return
+            self._remove_index_entry(self._content_index, previous_hash, track.id)
+            track.filename = relative_filename
+            track.content_hash = digest
+            self._content_index.setdefault(digest, {})[track.id] = None
+            try:
+                self._save()
+            except Exception:
+                self._remove_index_entry(self._content_index, digest, track.id)
+                track.filename = previous_filename
+                track.content_hash = previous_hash
+                if previous_hash:
+                    self._content_index.setdefault(previous_hash, {})[track.id] = None
+                raise
+            logger.info(
+                "Track file replaced: track_id=%s filename=%s",
+                track.id,
+                relative_filename,
+            )
 
     def update_track(
         self,
@@ -421,18 +473,35 @@ class MusicManager:
             title,
             source,
         )
-        if title is not None and not title.strip():
+        normalized_title = title.strip() if title is not None else None
+        if normalized_title is not None and not normalized_title:
             logger.warning("Refusing to set empty track title: track_id=%s", track_id)
             raise ValueError("Song title cannot be empty")
         with self._lock:
             track = self._get_track(track_id)
-            if title is not None:
-                track.title = title.strip()
-            if source is not None:
+            previous_title = track.title
+            previous_source = track.source
+            title_changed = (
+                normalized_title is not None and normalized_title != track.title
+            )
+            source_changed = source is not None and source != track.source
+            if not title_changed and not source_changed:
+                return
+            if title_changed:
+                track.title = normalized_title
+            if source_changed:
                 self._unindex_source(track)
                 track.source = source
                 self._index_source(track)
-            self._save()
+            try:
+                self._save()
+            except Exception:
+                if source_changed:
+                    self._unindex_source(track)
+                    track.source = previous_source
+                    self._index_source(track)
+                track.title = previous_title
+                raise
             logger.info(
                 "Track metadata updated: track_id=%s title=%r source=%r",
                 track.id,
@@ -448,22 +517,33 @@ class MusicManager:
         logger.debug("delete_track entered: track_id=%s", track_id)
         with self._lock:
             track_uuid = _as_uuid(track_id)
-            self._get_track(track_uuid)
-            removed_from_playlists = 0
+            track = self._get_track(track_uuid)
+            removed_references: list[tuple[Playlist, int]] = []
             for playlist in self._playlists.values():
-                previous_count = len(playlist.track_ids)
-                playlist.track_ids = [
-                    item for item in playlist.track_ids if item != track_uuid
-                ]
-                removed_from_playlists += previous_count - len(playlist.track_ids)
-            self._unindex_track(self._tracks[track_uuid])
+                try:
+                    index = playlist.track_ids.index(track_uuid)
+                except ValueError:
+                    continue
+                playlist.track_ids.pop(index)
+                removed_references.append((playlist, index))
+            previous_tracks = self._tracks
+            self._tracks = dict(self._tracks)
             del self._tracks[track_uuid]
+            previous_newest_track_ids = self._newest_track_ids
             self._newest_track_ids = None
-            self._save()
+            try:
+                self._save()
+            except Exception:
+                self._tracks = previous_tracks
+                self._newest_track_ids = previous_newest_track_ids
+                for playlist, index in removed_references:
+                    playlist.track_ids.insert(index, track_uuid)
+                raise
+            self._unindex_track(track)
             logger.info(
                 "Track record deleted; source file was left untouched: track_id=%s removed_playlist_references=%d",
                 track_uuid,
-                removed_from_playlists,
+                len(removed_references),
             )
 
     def clear_library(self) -> tuple[int, int]:
@@ -509,6 +589,11 @@ class MusicManager:
             tracks = tuple(replace(track) for track in self._tracks_newest_first())
         logger.debug("Listed tracks: count=%d", len(tracks))
         return tracks
+
+    def counts(self) -> tuple[int, int]:
+        """Return track and playlist counts without copying either collection."""
+        with self._lock:
+            return len(self._tracks), len(self._playlists)
 
     def get_track(self, track_id: UUID | str) -> Track:
         logger.debug("Getting track: track_id=%s", track_id)
@@ -591,7 +676,8 @@ class MusicManager:
     def check_track_integrity(self, track_id: UUID | str) -> IntegrityProblem | None:
         logger.debug("Checking track integrity: track_id=%s", track_id)
         with self._lock:
-            problem = self._integrity_problem(self._get_track(track_id))
+            track = replace(self._get_track(track_id))
+        problem = self._integrity_problem(track)
         logger.info(
             "Track integrity check completed: track_id=%s result=%s",
             track_id,
@@ -607,11 +693,12 @@ class MusicManager:
         """
         logger.debug("Checking library integrity")
         with self._lock:
-            problems = tuple(
-                problem
-                for track in self._tracks.values()
-                if (problem := self._integrity_problem(track)) is not None
-            )
+            tracks = tuple(replace(track) for track in self._tracks.values())
+        problems = tuple(
+            problem
+            for track in tracks
+            if (problem := self._integrity_problem(track)) is not None
+        )
         logger.info(
             "Library integrity check completed: problem_count=%d", len(problems)
         )
@@ -633,12 +720,18 @@ class MusicManager:
                 exc,
             )
             return IntegrityProblem(track.id, track.filename, "invalid_path", str(exc))
-        if not path.exists():
+        try:
+            file_status = path.stat()
+        except FileNotFoundError:
             logger.warning("Track file is missing: track_id=%s path=%s", track.id, path)
             return IntegrityProblem(
                 track.id, track.filename, "missing", f"Missing file: {path}"
             )
-        if not path.is_file():
+        except OSError as exc:
+            return IntegrityProblem(
+                track.id, track.filename, "unreadable", f"Cannot read {path}: {exc}"
+            )
+        if not stat.S_ISREG(file_status.st_mode):
             logger.warning(
                 "Track path is not a regular file: track_id=%s path=%s", track.id, path
             )
@@ -647,6 +740,13 @@ class MusicManager:
                 track.filename,
                 "missing",
                 f"Expected a file but found: {path}",
+            )
+        if file_status.st_size <= 0:
+            return IntegrityProblem(
+                track.id,
+                track.filename,
+                "empty",
+                f"Audio file is empty: {path}",
             )
         try:
             actual_hash = _sha256(path)
@@ -724,7 +824,11 @@ class MusicManager:
         with self._lock:
             playlist_id = uuid4()
             self._playlists[playlist_id] = Playlist(playlist_id, name)
-            self._save()
+            try:
+                self._save()
+            except Exception:
+                self._playlists.pop(playlist_id, None)
+                raise
             logger.info("Playlist created: playlist_id=%s name=%r", playlist_id, name)
             return playlist_id
 
@@ -740,8 +844,16 @@ class MusicManager:
             )
             raise ValueError("Playlist name cannot be empty")
         with self._lock:
-            self._get_playlist(playlist_id).name = name
-            self._save()
+            playlist = self._get_playlist(playlist_id)
+            previous_name = playlist.name
+            if previous_name == name:
+                return
+            playlist.name = name
+            try:
+                self._save()
+            except Exception:
+                playlist.name = previous_name
+                raise
             logger.info("Playlist renamed: playlist_id=%s name=%r", playlist_id, name)
 
     def delete_playlist(self, playlist_id: UUID | str) -> None:
@@ -753,8 +865,14 @@ class MusicManager:
                     "Cannot delete missing playlist: playlist_id=%s", playlist_uuid
                 )
                 raise KeyError(f"No playlist with id {playlist_uuid}")
+            previous_playlists = self._playlists
+            self._playlists = dict(self._playlists)
             del self._playlists[playlist_uuid]
-            self._save()
+            try:
+                self._save()
+            except Exception:
+                self._playlists = previous_playlists
+                raise
             logger.info("Playlist deleted: playlist_id=%s", playlist_uuid)
 
     def clear_playlists(self) -> int:
@@ -794,7 +912,8 @@ class MusicManager:
 
     def playlist_track_count(self, playlist_id: UUID | str) -> int:
         logger.debug("Counting tracks in playlist: playlist_id=%s", playlist_id)
-        count = len(self.playlist_tracks(playlist_id))
+        with self._lock:
+            count = len(self._get_playlist(playlist_id).track_ids)
         logger.debug(
             "Counted playlist tracks: playlist_id=%s track_count=%d", playlist_id, count
         )
@@ -809,7 +928,11 @@ class MusicManager:
             track = self._get_track(track_id)
             if track.id not in playlist.track_ids:
                 playlist.track_ids.append(track.id)
-                self._save()
+                try:
+                    self._save()
+                except Exception:
+                    playlist.track_ids.pop()
+                    raise
                 logger.info(
                     "Track added to playlist: playlist_id=%s track_id=%s",
                     playlist.id,
@@ -854,6 +977,42 @@ class MusicManager:
             )
             return len(additions)
 
+    def merge_tracks_into_playlist(
+        self,
+        playlist_id: UUID | str,
+        ordered_track_ids: Sequence[UUID | str],
+    ) -> int:
+        """Place known tracks first in the requested order with one write.
+
+        Existing tracks not included in ``ordered_track_ids`` are retained
+        after the ordered prefix. This supports incremental imports without a
+        separate add, reload, and reorder persistence cycle.
+        """
+        with self._lock:
+            playlist = self._get_playlist(playlist_id)
+            ordered: list[UUID] = []
+            ordered_set: set[UUID] = set()
+            for track_id in ordered_track_ids:
+                normalized = self._get_track(track_id).id
+                if normalized not in ordered_set:
+                    ordered.append(normalized)
+                    ordered_set.add(normalized)
+
+            previous = playlist.track_ids
+            previous_set = set(previous)
+            merged = ordered + [
+                track_id for track_id in previous if track_id not in ordered_set
+            ]
+            if merged == previous:
+                return 0
+            playlist.track_ids = merged
+            try:
+                self._save()
+            except Exception:
+                playlist.track_ids = previous
+                raise
+            return len(ordered_set - previous_set)
+
     def remove_from_playlist(
         self, playlist_id: UUID | str, track_id: UUID | str
     ) -> None:
@@ -866,7 +1025,7 @@ class MusicManager:
             playlist = self._get_playlist(playlist_id)
             track_uuid = _as_uuid(track_id)
             try:
-                playlist.track_ids.remove(track_uuid)
+                index = playlist.track_ids.index(track_uuid)
             except ValueError:
                 logger.warning(
                     "Cannot remove track absent from playlist: playlist_id=%s track_id=%s",
@@ -876,7 +1035,12 @@ class MusicManager:
                 raise KeyError(
                     f"Track {track_uuid} is not in playlist {playlist.id}"
                 ) from None
-            self._save()
+            playlist.track_ids.pop(index)
+            try:
+                self._save()
+            except Exception:
+                playlist.track_ids.insert(index, track_uuid)
+                raise
             logger.info(
                 "Track removed from playlist: playlist_id=%s track_id=%s",
                 playlist.id,
@@ -915,7 +1079,14 @@ class MusicManager:
                     playlist.track_ids[new_index],
                     playlist.track_ids[index],
                 )
-                self._save()
+                try:
+                    self._save()
+                except Exception:
+                    playlist.track_ids[index], playlist.track_ids[new_index] = (
+                        playlist.track_ids[new_index],
+                        playlist.track_ids[index],
+                    )
+                    raise
                 logger.info(
                     "Moved track within playlist: playlist_id=%s track_id=%s old_index=%d new_index=%d",
                     playlist.id,
@@ -946,12 +1117,20 @@ class MusicManager:
         with self._lock:
             playlist = self._get_playlist(playlist_id)
             normalized = [_as_uuid(track_id) for track_id in ordered_track_ids]
-            if len(normalized) != len(set(normalized)):
+            normalized_set = set(normalized)
+            if len(normalized) != len(normalized_set):
                 raise ValueError("Playlist order contains duplicate tracks")
-            if set(normalized) != set(playlist.track_ids):
+            if normalized_set != set(playlist.track_ids):
                 raise ValueError("Playlist order must contain every existing track")
+            if normalized == playlist.track_ids:
+                return
+            previous = playlist.track_ids
             playlist.track_ids = normalized
-            self._save()
+            try:
+                self._save()
+            except Exception:
+                playlist.track_ids = previous
+                raise
 
     def copy_playlist_track(
         self,
@@ -968,7 +1147,11 @@ class MusicManager:
                 raise KeyError(f"Track {track.id} is not in playlist {source.id}")
             if track.id not in target.track_ids:
                 target.track_ids.append(track.id)
-                self._save()
+                try:
+                    self._save()
+                except Exception:
+                    target.track_ids.pop()
+                    raise
 
     def move_track_between_playlists(
         self,
@@ -983,12 +1166,21 @@ class MusicManager:
             track = self._get_track(track_id)
             if source.id == target.id:
                 return
-            if track.id not in source.track_ids:
+            try:
+                source_index = source.track_ids.index(track.id)
+            except ValueError:
                 raise KeyError(f"Track {track.id} is not in playlist {source.id}")
-            source.track_ids.remove(track.id)
-            if track.id not in target.track_ids:
+            source.track_ids.pop(source_index)
+            added_to_target = track.id not in target.track_ids
+            if added_to_target:
                 target.track_ids.append(track.id)
-            self._save()
+            try:
+                self._save()
+            except Exception:
+                source.track_ids.insert(source_index, track.id)
+                if added_to_target:
+                    target.track_ids.pop()
+                raise
 
     # -- internal helpers -------------------------------------------
     def _relative_filename(self, filename: str | Path) -> str:
@@ -1027,7 +1219,7 @@ class MusicManager:
         )
         return path
 
-    def _tracks_newest_first(self) -> list[Track]:
+    def _tracks_newest_first(self) -> Iterator[Track]:
         """Return tracks in display order, sorting only after membership changes."""
         if self._newest_track_ids is None:
             self._newest_track_ids = tuple(
@@ -1037,7 +1229,7 @@ class MusicManager:
                     reverse=True,
                 )
             )
-        return [self._tracks[track_id] for track_id in self._newest_track_ids]
+        return (self._tracks[track_id] for track_id in self._newest_track_ids)
 
     def _rebuild_track_indexes(self) -> None:
         """Build O(1) source/content lookup tables after loading metadata."""
