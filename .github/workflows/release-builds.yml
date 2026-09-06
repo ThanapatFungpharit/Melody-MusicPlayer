@@ -1,0 +1,114 @@
+name: Application builds
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    environment: production
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: windows
+            architectures: --architecture x86_64
+          - os: ubuntu-latest
+            target: linux
+            architectures: --architecture x86_64
+          - os: macos-latest
+            target: macos
+            architectures: --architecture x86_64 --architecture arm64
+    runs-on: ${{ matrix.os }}
+    env:
+      MELODY_ENV: production
+      MELODY_DEBUG: "0"
+      FLET_DEBUG: "0"
+      PYTHONDEVMODE: "0"
+      PYTHONASYNCIODEBUG: "0"
+      PYTHONOPTIMIZE: "2"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Install isolated release toolchain
+        run: uv sync --frozen --no-dev --group build
+      - name: Build desktop bundle
+        shell: bash
+        run: >-
+          uv run --frozen --no-dev --group build python tools/build_desktop.py
+          ${{ matrix.target }}
+          ${{ matrix.architectures }}
+          -- --yes
+      - name: Verify production artifact
+        run: >-
+          uv run --frozen --no-dev --group build python
+          tools/verify_production_artifact.py
+          build/${{ matrix.target }}
+      - name: Upload desktop bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: melody-${{ matrix.target }}
+          path: build/${{ matrix.target }}
+
+  android:
+    environment: production
+    runs-on: ubuntu-latest
+    env:
+      MELODY_ENV: production
+      MELODY_DEBUG: "0"
+      FLET_DEBUG: "0"
+      PYTHONDEVMODE: "0"
+      PYTHONASYNCIODEBUG: "0"
+      PYTHONOPTIMIZE: "2"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Install isolated release toolchain
+        run: uv sync --frozen --no-dev --group build
+      - name: Configure Android release signing
+        shell: bash
+        env:
+          ANDROID_KEY_STORE_BASE64: ${{ secrets.ANDROID_KEY_STORE_BASE64 }}
+          ANDROID_KEY_STORE_PASSWORD: ${{ secrets.ANDROID_KEY_STORE_PASSWORD }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          for name in ANDROID_KEY_STORE_BASE64 ANDROID_KEY_STORE_PASSWORD ANDROID_KEY_PASSWORD ANDROID_KEY_ALIAS; do
+            if [ -z "${!name}" ]; then
+              echo "Missing required production secret: ${name}" >&2
+              exit 1
+            fi
+          done
+          key_store="$RUNNER_TEMP/melody-upload.jks"
+          printf '%s' "$ANDROID_KEY_STORE_BASE64" | base64 --decode > "$key_store"
+          echo "FLET_ANDROID_SIGNING_KEY_STORE=$key_store" >> "$GITHUB_ENV"
+          echo "FLET_ANDROID_SIGNING_KEY_STORE_PASSWORD=$ANDROID_KEY_STORE_PASSWORD" >> "$GITHUB_ENV"
+          echo "FLET_ANDROID_SIGNING_KEY_PASSWORD=$ANDROID_KEY_PASSWORD" >> "$GITHUB_ENV"
+          echo "FLET_ANDROID_SIGNING_KEY_ALIAS=$ANDROID_KEY_ALIAS" >> "$GITHUB_ENV"
+      - name: Build Android APK
+        run: >-
+          uv run --frozen --no-dev --group build python -m tools.build_android apk
+          -- --yes --split-per-abi
+      - name: Build Android App Bundle
+        run: >-
+          uv run --frozen --no-dev --group build python -m tools.build_android aab
+          -- --yes
+      - name: Verify production artifacts
+        run: >-
+          uv run --frozen --no-dev --group build python
+          tools/verify_production_artifact.py
+          build/apk build/aab
+      - name: Upload Android bundles
+        uses: actions/upload-artifact@v4
+        with:
+          name: melody-android
+          path: |
+            build/apk
+            build/aab

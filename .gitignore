@@ -1,0 +1,24 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+.flet/
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Local editor state
+.idea/
+.vscode/
+
+# Generated, platform-specific FFmpeg application resources
+src/musicplayer/bin/*/*/ffmpeg
+src/musicplayer/bin/*/*/ffprobe
+src/musicplayer/bin/*/*/ffmpeg.exe
+src/musicplayer/bin/*/*/ffprobe.exe
+src/musicplayer/bin/*/*/bundle.json

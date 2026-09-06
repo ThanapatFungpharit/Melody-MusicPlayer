@@ -1,0 +1,4 @@
+error: invalid value 'text' for '--output-format <OUTPUT_FORMAT>'
+  [possible values: full, concise, gitlab, github, junit]
+
+For more information, try '--help'.
