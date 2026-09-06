@@ -66,6 +66,7 @@ _REQUIREMENT_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*")
 _REQUIRED_RUNTIME_SOURCES = {
     "_sp_bootstrap.py",
     "flet/messaging/__init__.py",
+    "bundle-metadata/com.android.tools.build.obfuscation/proguard.map",
 }
 _REMOTE_DEBUGGING_FILES = {
     "_remote_debugging.pyd",
