@@ -19,8 +19,8 @@ jobs:
       PYTHONOPTIMIZE: "2"
       PYTHONIOENCODING: "utf-8"
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v9.0.0
         with:
           enable-cache: true
       - name: Install isolated release toolchain
@@ -38,10 +38,11 @@ jobs:
           tools/verify_production_artifact.py
           build/windows
       - name: Upload desktop bundle
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: melody-windows
+          name: melody-windows-x86_64
           path: build/windows
+          if-no-files-found: error
 
   linux:
     environment: production
@@ -55,8 +56,8 @@ jobs:
       PYTHONOPTIMIZE: "2"
       PYTHONIOENCODING: "utf-8"
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v9.0.0
         with:
           enable-cache: true
       - name: Install isolated release toolchain
@@ -76,14 +77,19 @@ jobs:
           tools/verify_production_artifact.py
           build/linux
       - name: Upload desktop bundle
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: melody-linux
+          name: melody-linux-x86_64
           path: build/linux
+          if-no-files-found: error
 
   macos:
     environment: production
     runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        architecture: [x86_64, arm64]
     env:
       MELODY_ENV: production
       MELODY_DEBUG: "0"
@@ -93,10 +99,11 @@ jobs:
       PYTHONOPTIMIZE: "2"
       PYTHONIOENCODING: "utf-8"
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v9.0.0
         with:
           enable-cache: true
+          cache-suffix: ${{ matrix.architecture }}
       - name: Install isolated release toolchain
         run: uv sync --frozen --no-dev --group build
       - name: Build desktop bundle
@@ -104,7 +111,7 @@ jobs:
         run: >-
           uv run --frozen --no-dev --group build python tools/build_desktop.py
           macos
-          --architecture x86_64 --architecture arm64
+          --architecture ${{ matrix.architecture }}
           -- --yes
       - name: Verify production artifact
         run: >-
@@ -112,10 +119,11 @@ jobs:
           tools/verify_production_artifact.py
           build/macos
       - name: Upload desktop bundle
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: melody-macos
+          name: melody-macos-${{ matrix.architecture }}
           path: build/macos
+          if-no-files-found: error
 
   android:
     environment: production
@@ -129,8 +137,8 @@ jobs:
       PYTHONOPTIMIZE: "2"
       PYTHONIOENCODING: "utf-8"
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v9.0.0
         with:
           enable-cache: true
       - name: Install isolated release toolchain
@@ -168,13 +176,30 @@ jobs:
           uv run --frozen --no-dev --group build python
           tools/verify_production_artifact.py
           build/apk build/aab
-      - name: Upload Android bundles
-        uses: actions/upload-artifact@v4
+      - name: Upload Android arm64-v8a APK
+        uses: actions/upload-artifact@v7
         with:
-          name: melody-android
-          path: |
-            build/apk
-            build/aab
+          name: melody-android-arm64-v8a
+          path: build/apk/*-arm64-v8a-*.apk
+          if-no-files-found: error
+      - name: Upload Android armeabi-v7a APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: melody-android-armeabi-v7a
+          path: build/apk/*-armeabi-v7a-*.apk
+          if-no-files-found: error
+      - name: Upload Android x86_64 APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: melody-android-x86_64
+          path: build/apk/*-x86_64-*.apk
+          if-no-files-found: error
+      - name: Upload Android App Bundle
+        uses: actions/upload-artifact@v7
+        with:
+          name: melody-android-aab
+          path: build/aab/*.aab
+          if-no-files-found: error
 
   release:
     name: Publish Release
@@ -185,7 +210,7 @@ jobs:
       contents: write
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
       - name: Archive artifacts for release
@@ -197,7 +222,7 @@ jobs:
             fi
           done
       - name: Publish to GitHub Releases
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: artifacts/*.zip
           generate_release_notes: true

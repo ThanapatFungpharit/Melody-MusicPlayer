@@ -105,14 +105,15 @@ extracts only `ffmpeg` and `ffprobe`, and then packages them with the app:
 uv sync --no-dev --group build
 uv run python tools/build_desktop.py windows --architecture x86_64 -- --yes
 uv run python tools/build_desktop.py linux --architecture x86_64 -- --yes
-uv run python tools/build_desktop.py macos --architecture x86_64 --architecture arm64 -- --yes
+uv run python tools/build_desktop.py macos --architecture x86_64 -- --yes
+uv run python tools/build_desktop.py macos --architecture arm64 -- --yes
 ```
 
-The macOS command creates a universal bundle containing both Intel and Apple
-Silicon tools. The release workflow builds all three desktop targets and
-uploads one artifact per operating system. Generated binaries are deliberately
-kept out of Git; every distributable artifact obtains them from the pinned,
-checksum-verified manifest in `tools/fetch_media_binaries.py`.
+The release workflow builds separate Intel and Apple Silicon macOS bundles and
+uploads every desktop bundle with its architecture in the artifact name.
+Generated binaries are deliberately kept out of Git; every distributable
+artifact obtains them from the pinned, checksum-verified manifest in
+`tools/fetch_media_binaries.py`.
 
 ## Android bundles
 
@@ -127,11 +128,12 @@ uv run python -m tools.build_android apk -- --yes --split-per-abi
 uv run python -m tools.build_android aab -- --yes
 ```
 
-The default Android build supports `arm64-v8a` devices and `x86_64` emulators,
+The default Android build supports `arm64-v8a`, `armeabi-v7a`, and `x86_64`,
 targets Android 10/API 29 or newer, and bundles both `ffmpeg` and `ffprobe`.
-Use `--architecture arm64` or `--architecture x86_64` before `--` to build a
-single ABI. The release workflow produces both side-loadable APKs and a Google
-Play App Bundle.
+Use `--architecture arm64`, `--architecture arm`, or `--architecture x86_64`
+before `--` to build a single ABI. The release workflow uploads each
+side-loadable APK as an architecture-specific artifact and uploads the Google
+Play App Bundle separately.
 
 ## Production release safeguards
 
