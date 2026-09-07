@@ -137,6 +137,48 @@ class MusicManagerTests(unittest.TestCase):
         self.manager.delete_track(track_id)
         self.assertTrue(path.exists())
 
+    def test_local_import_keeps_audio_when_registration_rollback_fails(self) -> None:
+        source = self.root / "outside.mp3"
+        source.write_bytes(b"local audio")
+        store = ApplicationStore(self.root / "state.json")
+        library = LibraryService(self.manager, store)
+
+        with (
+            patch.object(store, "save_track_details", side_effect=OSError("disk full")),
+            patch.object(
+                self.manager, "delete_track", side_effect=OSError("read only")
+            ),
+            self.assertLogs("musicplayer.application.library_service", level="ERROR"),
+            self.assertRaisesRegex(OSError, "disk full"),
+        ):
+            library.import_local_file(source)
+
+        tracks = self.manager.list_tracks()
+        self.assertEqual(len(tracks), 1)
+        self.assertEqual(
+            self.manager.track_path(tracks[0].id).read_bytes(), b"local audio"
+        )
+        self.assertEqual(source.read_bytes(), b"local audio")
+
+    def test_local_import_cleanup_failure_preserves_original_error(self) -> None:
+        source = self.root / "outside.mp3"
+        source.write_bytes(b"local audio")
+        store = ApplicationStore(self.root / "state.json")
+        library = LibraryService(self.manager, store)
+
+        with (
+            patch.object(store, "save_track_details", side_effect=OSError("disk full")),
+            patch.object(Path, "unlink", side_effect=PermissionError("file locked")),
+            self.assertLogs("musicplayer.application.library_service", level="WARNING"),
+            self.assertRaisesRegex(OSError, "disk full"),
+        ):
+            library.import_local_file(source)
+
+        self.assertEqual(self.manager.list_tracks(), ())
+        self.assertEqual((self.music / source.name).read_bytes(), b"local audio")
+        reloaded = MusicManager(self.root / "library.mmdb", self.music)
+        self.assertEqual(reloaded.list_tracks(), ())
+
     def test_clear_library_removes_tracks_and_playlists_but_keeps_files(self) -> None:
         track_id = self.add_track("kept.mp3")
         path = self.manager.track_path(track_id)

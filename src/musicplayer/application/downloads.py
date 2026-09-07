@@ -7,7 +7,7 @@ import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from musicplayer.core.downloader import (
     Downloader,
@@ -17,6 +17,7 @@ from musicplayer.core.downloader import (
     DownloadTask,
 )
 from musicplayer.core.library import MusicManager
+from musicplayer.core.library.models import Track
 from musicplayer.core.library.utils import source_key
 from musicplayer.runtime_environment import public_error_message
 
@@ -151,17 +152,7 @@ class DownloadCoordinator:
         return self._start(metadata)
 
     def start_url(self, url: str, *, title: str = "New download") -> DownloadTask:
-        metadata = {
-            "url": url.strip(),
-            "title": title,
-            "uploader": "",
-            "thumbnail": "",
-            "source": "YouTube",
-            "kind": "track",
-            "duration": 0.0,
-            "resolve_metadata": True,
-        }
-        return self._start(metadata)
+        return self._start(_url_metadata(url.strip(), title=title))
 
     def start_urls(self, urls: Iterable[str]) -> DownloadBatch:
         """Schedule a URL collection as one batch without coupling its failures.
@@ -174,11 +165,12 @@ class DownloadCoordinator:
         seen: set[str] = set()
         for value in urls:
             source = str(value).strip()
-            if source and source not in seen:
-                if not is_youtube_url(source):
-                    raise ValueError("Only YouTube URLs are supported.")
-                sources.append(source)
-                seen.add(source)
+            if not source or source in seen:
+                continue
+            if not is_youtube_url(source):
+                raise ValueError("Only YouTube URLs are supported.")
+            sources.append(source)
+            seen.add(source)
         if not sources:
             raise ValueError("At least one YouTube URL is required.")
 
@@ -187,14 +179,7 @@ class DownloadCoordinator:
         tasks: list[DownloadTask] = []
         for position, source in enumerate(sources, start=1):
             metadata: dict[str, object] = {
-                "url": source,
-                "title": f"Song {position} of {len(sources)}",
-                "uploader": "",
-                "thumbnail": "",
-                "source": "YouTube",
-                "kind": "track",
-                "duration": 0.0,
-                "resolve_metadata": True,
+                **_url_metadata(source, title=f"Song {position} of {len(sources)}"),
                 "batch_id": batch_id,
                 "batch_position": position,
                 "batch_size": len(sources),
@@ -319,44 +304,9 @@ class DownloadCoordinator:
             stored_paths: list[Path] = []
             try:
                 for path in result.files:
-                    source = str(metadata["url"])
-                    existing = self.manager.find_track_by_source(
-                        source
-                    ) or self.manager.find_track_by_content(path)
-                    if existing is not None:
-                        track_id = existing.id
-                        problem = self.manager.check_track_integrity(existing.id)
-                        if problem is None:
-                            existing_path = self.manager.track_path(existing.id)
-                            if path.resolve() != existing_path.resolve():
-                                path.unlink()
-                            stored_path = existing_path
-                        else:
-                            self.manager.replace_track_file(existing.id, path)
-                            stored_path = self.manager.track_path(existing.id)
-                        if not existing.source:
-                            self.manager.update_track(existing.id, source=source)
-                        logger.info(
-                            "Downloaded media reused or repaired a library track: "
-                            "source=%s track_id=%s integrity=%s",
-                            source,
-                            track_id,
-                            problem.kind if problem else "intact",
-                        )
-                    else:
-                        track_id = self.manager.add_track(
-                            path,
-                            source=str(metadata["url"]),
-                            title=str(metadata.get("title") or path.stem),
-                        )
-                        details = TrackDetails(
-                            uploader=uploader,
-                            duration=float(str(metadata.get("duration") or 0)),
-                            thumbnail=thumbnail,
-                            source_name=str(metadata.get("source") or "YouTube"),
-                        )
-                        self.store.save_track_details(str(track_id), details)
-                        stored_path = self.manager.track_path(track_id)
+                    track_id, stored_path = self._import_downloaded_file(
+                        path, metadata, uploader=uploader, thumbnail=thumbnail
+                    )
                     imported.append(str(track_id))
                     stored_paths.append(stored_path)
             except Exception as error:
@@ -387,25 +337,64 @@ class DownloadCoordinator:
             self._persist()
         self._notify(record)
 
+    def _import_downloaded_file(
+        self,
+        path: Path,
+        metadata: dict[str, object],
+        *,
+        uploader: str,
+        thumbnail: str,
+    ) -> tuple[UUID, Path]:
+        """Register audio or reuse its library identity, preserving existing metadata."""
+        source = str(metadata["url"])
+        existing = self.manager.find_track_by_source(
+            source
+        ) or self.manager.find_track_by_content(path)
+        if existing is not None:
+            return existing.id, self._reuse_library_track(existing, path, source)
+
+        track_id = self.manager.add_track(
+            path,
+            source=source,
+            title=str(metadata.get("title") or path.stem),
+        )
+        details = TrackDetails(
+            uploader=uploader,
+            duration=float(str(metadata.get("duration") or 0)),
+            thumbnail=thumbnail,
+            source_name=str(metadata.get("source") or "YouTube"),
+        )
+        self.store.save_track_details(str(track_id), details)
+        return track_id, self.manager.track_path(track_id)
+
+    def _reuse_library_track(self, track: Track, path: Path, source: str) -> Path:
+        """Keep intact audio, or repair its file without replacing the track record."""
+        problem = self.manager.check_track_integrity(track.id)
+        if problem is None:
+            stored_path = self.manager.track_path(track.id)
+            if path.resolve() != stored_path.resolve():
+                path.unlink()
+        else:
+            self.manager.replace_track_file(track.id, path)
+            stored_path = self.manager.track_path(track.id)
+        if not track.source:
+            self.manager.update_track(track.id, source=source)
+        logger.info(
+            "Downloaded media reused or repaired a library track: "
+            "source=%s track_id=%s integrity=%s",
+            source,
+            track.id,
+            problem.kind if problem else "intact",
+        )
+        return stored_path
+
     def _record(
         self, task: DownloadTask, metadata: dict[str, object]
     ) -> DownloadRecord:
         key = str(task.id)
         record = self._records.get(key)
         if record is None:
-            record = DownloadRecord(
-                id=key,
-                url=str(metadata["url"]),
-                title=str(metadata["title"]),
-                uploader=str(metadata.get("uploader") or ""),
-                thumbnail=str(metadata.get("thumbnail") or ""),
-                source=str(metadata.get("source") or "YouTube"),
-                kind=str(metadata.get("kind") or "track"),
-                created_at=float(str(metadata.get("created_at") or time.time())),
-                batch_id=str(metadata.get("batch_id") or ""),
-                batch_position=int(str(metadata.get("batch_position") or 0)),
-                batch_size=int(str(metadata.get("batch_size") or 0)),
-            )
+            record = _record_from_metadata(key, metadata)
             self._records[key] = record
             identity = source_key(record.url)
             if identity:
@@ -417,22 +406,10 @@ class DownloadCoordinator:
     def _record_start_failure(
         self, metadata: dict[str, object], error: Exception
     ) -> None:
-        record = DownloadRecord(
-            id=str(uuid4()),
-            url=str(metadata["url"]),
-            title=str(metadata["title"]),
-            uploader=str(metadata.get("uploader") or ""),
-            thumbnail=str(metadata.get("thumbnail") or ""),
-            source=str(metadata.get("source") or "YouTube"),
-            kind=str(metadata.get("kind") or "track"),
-            status="failed",
-            error=_friendly_download_error(str(error)),
-            created_at=float(str(metadata.get("created_at") or time.time())),
-            completed_at=time.time(),
-            batch_id=str(metadata.get("batch_id") or ""),
-            batch_position=int(str(metadata.get("batch_position") or 0)),
-            batch_size=int(str(metadata.get("batch_size") or 0)),
-        )
+        record = _record_from_metadata(str(uuid4()), metadata)
+        record.status = "failed"
+        record.error = _friendly_download_error(str(error))
+        record.completed_at = time.time()
         with self._lock:
             self._records[record.id] = record
             self._ordered_records = None
@@ -474,9 +451,39 @@ class DownloadCoordinator:
         return self._records.get(record_id) if record_id is not None else None
 
 
-def _uuid(value: str):
-    from uuid import UUID
+def _url_metadata(url: str, *, title: str) -> dict[str, object]:
+    """Metadata shared by direct URLs and individual songs in a batch."""
+    return {
+        "url": url,
+        "title": title,
+        "uploader": "",
+        "thumbnail": "",
+        "source": "YouTube",
+        "kind": "track",
+        "duration": 0.0,
+        "resolve_metadata": True,
+    }
 
+
+def _record_from_metadata(
+    record_id: str, metadata: dict[str, object]
+) -> DownloadRecord:
+    return DownloadRecord(
+        id=record_id,
+        url=str(metadata["url"]),
+        title=str(metadata["title"]),
+        uploader=str(metadata.get("uploader") or ""),
+        thumbnail=str(metadata.get("thumbnail") or ""),
+        source=str(metadata.get("source") or "YouTube"),
+        kind=str(metadata.get("kind") or "track"),
+        created_at=float(str(metadata.get("created_at") or time.time())),
+        batch_id=str(metadata.get("batch_id") or ""),
+        batch_position=int(str(metadata.get("batch_position") or 0)),
+        batch_size=int(str(metadata.get("batch_size") or 0)),
+    )
+
+
+def _uuid(value: str) -> UUID:
     try:
         return UUID(value)
     except ValueError as error:

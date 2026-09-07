@@ -86,7 +86,7 @@ class MusicManager:
         logger.debug(
             "Read music metadata: path=%s byte_count=%d", self.metadata_path, len(data)
         )
-        version, track_count = self._read_metadataHEADER(data)
+        version, track_count = self._read_metadata_header(data)
         logger.info(
             "Parsing music metadata: path=%s version=%d track_count=%d",
             self.metadata_path,
@@ -135,7 +135,7 @@ class MusicManager:
             self._save()
         self._rebuild_track_indexes()
 
-    def _read_metadataHEADER(self, data: bytes) -> tuple[int, int]:
+    def _read_metadata_header(self, data: bytes) -> tuple[int, int]:
         if len(data) < HEADER.size:
             logger.error(
                 "Music metadata header is truncated: path=%s byte_count=%d",

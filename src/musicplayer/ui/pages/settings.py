@@ -29,6 +29,30 @@ class SettingsPage(_Base):
     """Settings page UI and persistence workflow."""
 
     def _settings_view(self) -> ft.Control:
+        download = self._build_download_settings()
+        appearance = self._build_appearance_settings()
+        youtube_access = self._build_youtube_settings()
+        data_management = self._build_data_management_settings()
+        footer = self._build_settings_footer()
+        return ft.Column(
+            [
+                self._context_header(
+                    "Settings",
+                    "Tune playback, downloads, YouTube access, personalization, and appearance.",
+                ),
+                self._responsive_grid(
+                    [appearance, download, youtube_access, data_management],
+                    scroll=ft.ScrollMode.AUTO,
+                    expand=True,
+                ),
+                ft.Divider(height=1),
+                footer,
+            ],
+            spacing=16,
+            expand=True,
+        )
+
+    def _build_download_settings(self) -> ft.Container:
         self.settings_path = ft.TextField(
             value=self.settings.download_directory,
             label="Music & download folder",
@@ -74,6 +98,68 @@ class SettingsPage(_Base):
             weight=ft.FontWeight.BOLD,
             color=ft.Colors.PRIMARY,
         )
+        for control in (self.settings_format, self.settings_quality):
+            control.col = {"xs": 12, "md": 6}
+        return _settings_card(
+            [
+                self._settings_section_header(
+                    ft.Icons.DOWNLOAD_FOR_OFFLINE_ROUNDED,
+                    "Download defaults",
+                    "Control where audio is saved and how new downloads are processed.",
+                ),
+                self.settings_path,
+                self._responsive_grid(
+                    [self.settings_format, self.settings_quality],
+                    spacing=12,
+                    run_spacing=12,
+                ),
+                ft.Row(
+                    [
+                        ft.Column(
+                            [
+                                ft.Text(
+                                    "Concurrent downloads",
+                                    weight=ft.FontWeight.BOLD,
+                                ),
+                                ft.Text(
+                                    "Balance speed against network and CPU usage.",
+                                    size=12,
+                                    color=ft.Colors.ON_SURFACE_VARIANT,
+                                ),
+                            ],
+                            spacing=2,
+                            expand=True,
+                        ),
+                        self.settings_concurrency_value,
+                    ]
+                ),
+                self.settings_concurrency,
+                ft.Container(
+                    ft.Row(
+                        [
+                            ft.Icon(
+                                ft.Icons.RESTART_ALT_ROUNDED,
+                                size=20,
+                                color=ft.Colors.PRIMARY,
+                            ),
+                            ft.Text(
+                                "Download changes apply after restarting Melody.",
+                                size=12,
+                                color=ft.Colors.ON_SURFACE_VARIANT,
+                                expand=True,
+                            ),
+                        ],
+                        spacing=10,
+                    ),
+                    padding=12,
+                    border_radius=12,
+                    bgcolor=ft.Colors.PRIMARY_CONTAINER,
+                ),
+            ],
+            columns={"xs": 12, "lg": 6, "xl": 4},
+        )
+
+    def _build_appearance_settings(self) -> ft.Container:
         self.settings_theme = ft.Dropdown(
             value=self.settings.theme,
             label="Theme",
@@ -94,6 +180,27 @@ class SettingsPage(_Base):
         # -- accent color picker ----------------------------------------
         self._selected_accent = self.settings.accent_color
         self.accent_picker = self._build_accent_picker()
+        return _settings_card(
+            [
+                self._settings_section_header(
+                    ft.Icons.TUNE_ROUNDED,
+                    "Appearance & session",
+                    "Choose how Melody looks and restores your workspace.",
+                ),
+                self.settings_theme,
+                ft.Text(
+                    "Accent color",
+                    weight=ft.FontWeight.BOLD,
+                ),
+                self.accent_picker,
+                ft.Divider(height=18),
+                self.settings_resume,
+                self.settings_notifications,
+            ],
+            columns={"xs": 12, "lg": 6, "xl": 4},
+        )
+
+    def _build_youtube_settings(self) -> ft.Container:
         self._pending_cookie_file: ValidatedCookieFile | None = None
         self._pending_cookie_name = ""
         self._remove_cookie_requested = False
@@ -101,16 +208,14 @@ class SettingsPage(_Base):
             self.settings.cookie_file and Path(self.settings.cookie_file).is_file()
         )
         cookie_missing = bool(self.settings.cookie_file) and not configured_cookie
+        if configured_cookie:
+            cookie_status = f"Using {Path(self.settings.cookie_file).name}"
+        elif cookie_missing:
+            cookie_status = "The saved cookie file is missing. Upload a replacement."
+        else:
+            cookie_status = "No cookie file uploaded. YouTube requests are anonymous."
         self.settings_cookie_status = ft.Text(
-            (
-                f"Using {Path(self.settings.cookie_file).name}"
-                if configured_cookie
-                else (
-                    "The saved cookie file is missing. Upload a replacement."
-                    if cookie_missing
-                    else "No cookie file uploaded. YouTube requests are anonymous."
-                )
-            ),
+            cookie_status,
             size=12,
             color=(ft.Colors.ERROR if cookie_missing else ft.Colors.ON_SURFACE_VARIANT),
             expand=True,
@@ -126,238 +231,143 @@ class SettingsPage(_Base):
             disabled=not configured_cookie,
             on_click=self._remove_cookie_file,
         )
-        general = card(
-            ft.Column(
-                [
-                    self._settings_section_header(
-                        ft.Icons.TUNE_ROUNDED,
-                        "Appearance & session",
-                        "Choose how Melody looks and restores your workspace.",
-                    ),
-                    self.settings_theme,
-                    ft.Text(
-                        "Accent color",
-                        weight=ft.FontWeight.BOLD,
-                    ),
-                    self.accent_picker,
-                    ft.Divider(height=18),
-                    self.settings_resume,
-                    self.settings_notifications,
-                ],
-                spacing=16,
-                horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
-            ),
-            padding=22,
-        )
-        general.col = {"xs": 12, "lg": 6, "xl": 4}
-        download = card(
-            ft.Column(
-                [
-                    self._settings_section_header(
-                        ft.Icons.DOWNLOAD_FOR_OFFLINE_ROUNDED,
-                        "Download defaults",
-                        "Control where audio is saved and how new downloads are processed.",
-                    ),
-                    self.settings_path,
-                    self._responsive_grid(
-                        [self.settings_format, self.settings_quality],
-                        spacing=12,
-                        run_spacing=12,
-                    ),
+        return _settings_card(
+            [
+                self._settings_section_header(
+                    ft.Icons.SMART_DISPLAY_ROUNDED,
+                    "YouTube access",
+                    "YouTube is Melody’s default and only music source.",
+                ),
+                ft.Text(
+                    "YouTube cookies",
+                    weight=ft.FontWeight.BOLD,
+                ),
+                ft.Container(
                     ft.Row(
+                        [
+                            ft.Icon(
+                                ft.Icons.COOKIE_OUTLINED,
+                                size=20,
+                                color=ft.Colors.ON_SURFACE_VARIANT,
+                            ),
+                            self.settings_cookie_status,
+                        ],
+                        spacing=10,
+                        vertical_alignment=ft.CrossAxisAlignment.START,
+                    ),
+                    padding=12,
+                    border_radius=12,
+                    bgcolor=ft.Colors.SURFACE_CONTAINER_HIGH,
+                ),
+                ft.Row(
+                    [
+                        self.settings_cookie_upload,
+                        self.settings_cookie_remove,
+                    ],
+                    spacing=10,
+                    scroll=ft.ScrollMode.AUTO,
+                ),
+                ft.Text(
+                    "Upload a UTF-8 Netscape cookies.txt export. Melody validates it and copies it to private app storage; it never reads browser cookie databases. The same flow works on desktop and Android.",
+                    size=12,
+                    color=ft.Colors.ON_SURFACE_VARIANT,
+                ),
+            ],
+            columns={"xs": 12, "lg": 12, "xl": 4},
+        )
+
+    def _build_data_management_settings(self) -> ft.Container:
+        return _settings_card(
+            [
+                self._settings_section_header(
+                    ft.Icons.DELETE_SWEEP_ROUNDED,
+                    "Reset / Data Management",
+                    "Remove only the local data you choose. Every action asks for confirmation.",
+                ),
+                self._responsive_grid(
+                    [
+                        self._data_management_action(
+                            "Clear Library",
+                            "Remove every library track and all playlists. Audio files stay on disk.",
+                            "Clear library",
+                            ft.Icons.LIBRARY_MUSIC_ROUNDED,
+                            "library",
+                        ),
+                        self._data_management_action(
+                            "Clear Playlists",
+                            "Delete user-created playlists while keeping every library track.",
+                            "Clear playlists",
+                            ft.Icons.QUEUE_MUSIC_ROUNDED,
+                            "playlists",
+                        ),
+                        self._data_management_action(
+                            "Reset Settings",
+                            "Restore appearance, playback, download, and session settings to defaults.",
+                            "Reset settings",
+                            ft.Icons.RESTART_ALT_ROUNDED,
+                            "settings",
+                        ),
+                    ],
+                    spacing=12,
+                    run_spacing=12,
+                ),
+                ft.Container(
+                    self._responsive_grid(
                         [
                             ft.Column(
                                 [
-                                    ft.Text(
-                                        "Concurrent downloads",
-                                        weight=ft.FontWeight.BOLD,
+                                    ft.Row(
+                                        [
+                                            ft.Icon(
+                                                ft.Icons.WARNING_AMBER_ROUNDED,
+                                                color=ft.Colors.ERROR,
+                                            ),
+                                            ft.Text(
+                                                "Reset Everything",
+                                                size=18,
+                                                weight=ft.FontWeight.BOLD,
+                                                color=ft.Colors.ERROR,
+                                            ),
+                                        ],
+                                        spacing=8,
                                     ),
                                     ft.Text(
-                                        "Balance speed against network and CPU usage.",
+                                        "Clear the library and playlists, empty the playback queue, and restore all settings. Audio files, download history, and search history are preserved.",
                                         size=12,
-                                        color=ft.Colors.ON_SURFACE_VARIANT,
+                                        color=ft.Colors.ON_ERROR_CONTAINER,
                                     ),
                                 ],
-                                spacing=2,
-                                expand=True,
+                                spacing=5,
+                                col={"xs": 12, "md": 8},
                             ),
-                            self.settings_concurrency_value,
-                        ]
-                    ),
-                    self.settings_concurrency,
-                    ft.Container(
-                        ft.Row(
-                            [
-                                ft.Icon(
-                                    ft.Icons.RESTART_ALT_ROUNDED,
-                                    size=20,
-                                    color=ft.Colors.PRIMARY,
+                            ft.Container(
+                                ft.Button(
+                                    "Reset everything",
+                                    icon=ft.Icons.DELETE_FOREVER_ROUNDED,
+                                    color=ft.Colors.ON_ERROR,
+                                    bgcolor=ft.Colors.ERROR,
+                                    height=52,
+                                    on_click=lambda _: self._confirm_data_action(
+                                        "everything"
+                                    ),
                                 ),
-                                ft.Text(
-                                    "Download changes apply after restarting Melody.",
-                                    size=12,
-                                    color=ft.Colors.ON_SURFACE_VARIANT,
-                                    expand=True,
-                                ),
-                            ],
-                            spacing=10,
-                        ),
-                        padding=12,
-                        border_radius=12,
-                        bgcolor=ft.Colors.PRIMARY_CONTAINER,
-                    ),
-                ],
-                spacing=16,
-                horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
-            ),
-            padding=22,
-        )
-        download.col = {"xs": 12, "lg": 6, "xl": 4}
-        for control in (self.settings_format, self.settings_quality):
-            control.col = {"xs": 12, "md": 6}
-        youtube_access = card(
-            ft.Column(
-                [
-                    self._settings_section_header(
-                        ft.Icons.SMART_DISPLAY_ROUNDED,
-                        "YouTube access",
-                        "YouTube is Melody’s default and only music source.",
-                    ),
-                    ft.Text(
-                        "YouTube cookies",
-                        weight=ft.FontWeight.BOLD,
-                    ),
-                    ft.Container(
-                        ft.Row(
-                            [
-                                ft.Icon(
-                                    ft.Icons.COOKIE_OUTLINED,
-                                    size=20,
-                                    color=ft.Colors.ON_SURFACE_VARIANT,
-                                ),
-                                self.settings_cookie_status,
-                            ],
-                            spacing=10,
-                            vertical_alignment=ft.CrossAxisAlignment.START,
-                        ),
-                        padding=12,
-                        border_radius=12,
-                        bgcolor=ft.Colors.SURFACE_CONTAINER_HIGH,
-                    ),
-                    ft.Row(
-                        [
-                            self.settings_cookie_upload,
-                            self.settings_cookie_remove,
-                        ],
-                        spacing=10,
-                        scroll=ft.ScrollMode.AUTO,
-                    ),
-                    ft.Text(
-                        "Upload a UTF-8 Netscape cookies.txt export. Melody validates it and copies it to private app storage; it never reads browser cookie databases. The same flow works on desktop and Android.",
-                        size=12,
-                        color=ft.Colors.ON_SURFACE_VARIANT,
-                    ),
-                ],
-                spacing=16,
-                horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
-            ),
-            padding=22,
-        )
-        youtube_access.col = {"xs": 12, "lg": 12, "xl": 4}
-        data_management = card(
-            ft.Column(
-                [
-                    self._settings_section_header(
-                        ft.Icons.DELETE_SWEEP_ROUNDED,
-                        "Reset / Data Management",
-                        "Remove only the local data you choose. Every action asks for confirmation.",
-                    ),
-                    self._responsive_grid(
-                        [
-                            self._data_management_action(
-                                "Clear Library",
-                                "Remove every library track and all playlists. Audio files stay on disk.",
-                                "Clear library",
-                                ft.Icons.LIBRARY_MUSIC_ROUNDED,
-                                "library",
-                            ),
-                            self._data_management_action(
-                                "Clear Playlists",
-                                "Delete user-created playlists while keeping every library track.",
-                                "Clear playlists",
-                                ft.Icons.QUEUE_MUSIC_ROUNDED,
-                                "playlists",
-                            ),
-                            self._data_management_action(
-                                "Reset Settings",
-                                "Restore appearance, playback, download, and session settings to defaults.",
-                                "Reset settings",
-                                ft.Icons.RESTART_ALT_ROUNDED,
-                                "settings",
+                                alignment=ft.Alignment.CENTER_RIGHT,
+                                col={"xs": 12, "md": 4},
                             ),
                         ],
                         spacing=12,
-                        run_spacing=12,
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
                     ),
-                    ft.Container(
-                        self._responsive_grid(
-                            [
-                                ft.Column(
-                                    [
-                                        ft.Row(
-                                            [
-                                                ft.Icon(
-                                                    ft.Icons.WARNING_AMBER_ROUNDED,
-                                                    color=ft.Colors.ERROR,
-                                                ),
-                                                ft.Text(
-                                                    "Reset Everything",
-                                                    size=18,
-                                                    weight=ft.FontWeight.BOLD,
-                                                    color=ft.Colors.ERROR,
-                                                ),
-                                            ],
-                                            spacing=8,
-                                        ),
-                                        ft.Text(
-                                            "Clear the library and playlists, empty the playback queue, and restore all settings. Audio files, download history, and search history are preserved.",
-                                            size=12,
-                                            color=ft.Colors.ON_ERROR_CONTAINER,
-                                        ),
-                                    ],
-                                    spacing=5,
-                                    col={"xs": 12, "md": 8},
-                                ),
-                                ft.Container(
-                                    ft.Button(
-                                        "Reset everything",
-                                        icon=ft.Icons.DELETE_FOREVER_ROUNDED,
-                                        color=ft.Colors.ON_ERROR,
-                                        bgcolor=ft.Colors.ERROR,
-                                        height=52,
-                                        on_click=lambda _: self._confirm_data_action(
-                                            "everything"
-                                        ),
-                                    ),
-                                    alignment=ft.Alignment.CENTER_RIGHT,
-                                    col={"xs": 12, "md": 4},
-                                ),
-                            ],
-                            spacing=12,
-                            vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                        ),
-                        padding=16,
-                        border_radius=14,
-                        bgcolor=ft.Colors.ERROR_CONTAINER,
-                        border=ft.Border.all(1, ft.Colors.ERROR),
-                    ),
-                ],
-                spacing=16,
-                horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
-            ),
-            padding=22,
+                    padding=16,
+                    border_radius=14,
+                    bgcolor=ft.Colors.ERROR_CONTAINER,
+                    border=ft.Border.all(1, ft.Colors.ERROR),
+                ),
+            ],
+            columns={"xs": 12},
         )
-        data_management.col = {"xs": 12}
+
+    def _build_settings_footer(self) -> ft.ResponsiveRow:
         footer_copy = ft.Text(
             "Changes are saved locally on this device.",
             size=12,
@@ -386,25 +396,9 @@ class SettingsPage(_Base):
             alignment=ft.Alignment.CENTER_RIGHT,
         )
         footer_actions.col = {"xs": 12, "md": 7}
-        return ft.Column(
-            [
-                self._context_header(
-                    "Settings",
-                    "Tune playback, downloads, YouTube access, personalization, and appearance.",
-                ),
-                self._responsive_grid(
-                    [general, download, youtube_access, data_management],
-                    scroll=ft.ScrollMode.AUTO,
-                    expand=True,
-                ),
-                ft.Divider(height=1),
-                self._responsive_grid(
-                    [footer_copy, footer_actions],
-                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                ),
-            ],
-            spacing=16,
-            expand=True,
+        return self._responsive_grid(
+            [footer_copy, footer_actions],
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
         )
 
     def _data_management_action(
@@ -840,3 +834,18 @@ class SettingsPage(_Base):
             if restart_required
             else "Settings saved."
         )
+
+
+def _settings_card(
+    controls: list[ft.Control], *, columns: ft.ResponsiveNumber
+) -> ft.Container:
+    section = card(
+        ft.Column(
+            controls,
+            spacing=16,
+            horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
+        ),
+        padding=22,
+    )
+    section.col = columns
+    return section

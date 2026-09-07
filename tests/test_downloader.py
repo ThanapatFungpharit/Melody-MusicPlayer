@@ -179,6 +179,148 @@ class DownloaderTests(unittest.TestCase):
                 downloader.shutdown()
 
 
+class DownloadImportTests(unittest.TestCase):
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.music = self.root / "music"
+        self.manager = MusicManager(self.root / "library.mmdb", self.music)
+        self.store = ApplicationStore(self.root / "state.json")
+        self.notifications: list[DownloadRecord] = []
+        with patch("musicplayer.application.downloads.Downloader"):
+            self.coordinator = DownloadCoordinator(
+                self.manager,
+                self.store,
+                AppSettings(download_directory=str(self.music)),
+                on_change=self.notifications.append,
+            )
+        self.task = DownloadTask(UUID(int=1))
+        self.url = "https://youtu.be/imported"
+        self.metadata: dict[str, object] = {
+            "url": self.url,
+            "title": "Downloaded song",
+            "source": "YouTube",
+            "duration": 123.5,
+            "resolve_metadata": True,
+        }
+
+    def complete(self, path: Path) -> DownloadRecord:
+        self.coordinator._handle_complete(
+            DownloadResult(self.task, self.url, DownloadStatus.COMPLETED, (path,)),
+            self.metadata,
+        )
+        return self.coordinator.list()[0]
+
+    def test_new_track_uses_metadata_resolved_during_progress(self) -> None:
+        path = self.music / "downloaded.mp3"
+        path.write_bytes(b"new audio")
+        self.coordinator._handle_progress(
+            DownloadProgress(
+                self.task,
+                self.url,
+                DownloadStatus.PROCESSING,
+                uploader="Resolved uploader",
+                thumbnail="https://example.test/artwork.jpg",
+            ),
+            self.metadata,
+        )
+
+        record = self.complete(path)
+
+        self.assertEqual(record.status, "completed")
+        self.assertEqual(record.progress, 1.0)
+        self.assertEqual(record.filename, path.name)
+        self.assertGreater(record.completed_at, 0)
+        track = self.manager.get_track(record.track_ids[0])
+        self.assertEqual(track.title, "Downloaded song")
+        details = self.store.track_details(str(track.id))
+        self.assertEqual(details.uploader, "Resolved uploader")
+        self.assertEqual(details.thumbnail, "https://example.test/artwork.jpg")
+        self.assertEqual(details.duration, 123.5)
+        self.assertEqual(self.coordinator.active_count(), 0)
+        self.assertEqual(self.store.downloads()[0].track_ids, [str(track.id)])
+
+    def test_source_match_takes_priority_over_content_match(self) -> None:
+        source_path = self.music / "source.mp3"
+        source_path.write_bytes(b"original source audio")
+        source_id = self.manager.add_track(source_path, source=self.url)
+        content_path = self.music / "content.mp3"
+        content_path.write_bytes(b"matching downloaded audio")
+        self.manager.add_track(content_path)
+        download_path = self.music / "downloaded.mp3"
+        download_path.write_bytes(content_path.read_bytes())
+
+        record = self.complete(download_path)
+
+        self.assertEqual(record.track_ids, [str(source_id)])
+        self.assertEqual(record.filename, source_path.name)
+        self.assertEqual(source_path.read_bytes(), b"original source audio")
+        self.assertTrue(content_path.exists())
+        self.assertFalse(download_path.exists())
+        self.assertEqual(len(self.manager.list_tracks()), 2)
+
+    def test_completion_keeps_file_that_is_already_managed(self) -> None:
+        path = self.music / "managed.mp3"
+        path.write_bytes(b"managed audio")
+        track_id = self.manager.add_track(path, source=self.url)
+
+        record = self.complete(path)
+
+        self.assertEqual(record.status, "completed")
+        self.assertEqual(record.track_ids, [str(track_id)])
+        self.assertEqual(path.read_bytes(), b"managed audio")
+        self.assertEqual(len(self.manager.list_tracks()), 1)
+
+    def test_import_failure_is_persisted_and_releases_active_source(self) -> None:
+        path = self.music / "downloaded.mp3"
+        path.write_bytes(b"downloaded audio")
+        self.coordinator._handle_progress(
+            DownloadProgress(self.task, self.url, DownloadStatus.PROCESSING),
+            self.metadata,
+        )
+        self.assertTrue(self.coordinator.is_source_active(self.url))
+        self.notifications.clear()
+
+        with (
+            patch.object(
+                self.store, "save_track_details", side_effect=OSError("disk full")
+            ),
+            self.assertLogs("musicplayer.application.downloads", level="ERROR"),
+        ):
+            record = self.complete(path)
+
+        self.assertEqual(record.status, "failed")
+        self.assertEqual(
+            record.error, "Downloaded, but could not add to the library: disk full"
+        )
+        self.assertEqual(record.track_ids, [])
+        self.assertEqual(record.completed_at, 0)
+        self.assertFalse(self.coordinator.is_source_active(self.url))
+        self.assertEqual(self.notifications, [record])
+        self.assertEqual(self.store.downloads()[0].status, "failed")
+        # A failed enriched-metadata write leaves the registered audio intact.
+        self.assertEqual(len(self.manager.list_tracks()), 1)
+        self.assertTrue(path.exists())
+
+    def test_failed_and_cancelled_results_do_not_import_audio(self) -> None:
+        path = self.music / "downloaded.mp3"
+        path.write_bytes(b"downloaded audio")
+        for status in (DownloadStatus.FAILED, DownloadStatus.CANCELLED):
+            with self.subTest(status=status):
+                self.coordinator._handle_complete(
+                    DownloadResult(self.task, self.url, status, (path,)),
+                    self.metadata,
+                )
+
+                record = self.coordinator.list()[0]
+                self.assertEqual(record.status, status.value)
+                self.assertEqual(record.track_ids, [])
+                self.assertEqual(record.completed_at, 0)
+                self.assertEqual(self.manager.list_tracks(), ())
+                self.assertTrue(path.exists())
+
+
 class BatchDownloadTests(unittest.TestCase):
     def test_known_source_blocks_only_when_its_managed_file_is_intact(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

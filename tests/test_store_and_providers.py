@@ -214,8 +214,198 @@ class StoreTests(unittest.TestCase):
             self.assertEqual(store.get("search_history"), ["keep this search"])
             self.assertEqual(store.get("downloads"), [{"id": "keep-this-download"}])
 
+    def test_recent_history_respects_small_limits(self) -> None:
+        for limit, expected in ((-1, []), (0, []), (1, ["new"]), (2, ["new", "old"])):
+            with self.subTest(limit=limit), tempfile.TemporaryDirectory() as directory:
+                store = ApplicationStore(Path(directory) / "state.json")
+                store.set("search_history", ["old", "older"])
+                store.add_recent("search_history", "new", limit=limit)
+                self.assertEqual(store.get("search_history"), expected)
+                self.assertEqual(
+                    ApplicationStore(store.path).get("search_history"), expected
+                )
+
+    def test_all_store_mutations_roll_back_when_replacement_fails(self) -> None:
+        mutations = {
+            "settings": lambda store: store.save_settings(AppSettings(volume=42)),
+            "new metadata": lambda store: store.save_track_details(
+                "new", TrackDetails()
+            ),
+            "existing metadata": lambda store: store.save_track_details(
+                "track", TrackDetails(uploader="updated")
+            ),
+            "metadata deletion": lambda store: store.remove_track_details("track"),
+            "library clearing": lambda store: store.clear_library_data(),
+            "new value": lambda store: store.set("new", {"nested": [1]}),
+            "existing value": lambda store: store.set("custom", None),
+            "recent history": lambda store: store.add_recent("search_history", "new"),
+            "new history": lambda store: store.add_recent("new_history", "new"),
+            "play recording": lambda store: store.record_play(
+                "track", played_at=2.0, playback={"queue": ["track"], "position_ms": 20}
+            ),
+            "new play recording": lambda store: store.record_play("new", played_at=2.0),
+            "downloads": lambda store: store.save_downloads(
+                [DownloadRecord(id="new", url="https://youtu.be/new", title="New")]
+            ),
+            "bulk favorites": lambda store: store.favorite_tracks(["track", "new"]),
+        }
+        for name, mutate in mutations.items():
+            with (
+                self.subTest(mutation=name),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                store = ApplicationStore(Path(directory) / "state.json")
+                store.record_play("track", played_at=1.0)
+                store.set("custom", {"nested": [0]})
+                store.add_recent("search_history", "old")
+                before = store.path.read_bytes()
+                expected = json.loads(before)
+
+                with (
+                    patch(
+                        "musicplayer.application.store.os.replace",
+                        side_effect=OSError("disk full"),
+                    ),
+                    self.assertRaisesRegex(OSError, "disk full"),
+                ):
+                    mutate(store)
+
+                self.assertEqual(store.path.read_bytes(), before)
+                self.assertEqual(store._data, expected)
+                self.assertEqual(list(Path(directory).glob("*.tmp")), [])
+
+    def test_unchanged_mutations_skip_writing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = ApplicationStore(Path(directory) / "state.json")
+            details = TrackDetails(favorite=True)
+            store.save_track_details("track", details)
+            store.set("custom", {"nested": [1]})
+            store.add_recent("search_history", "same")
+            with patch.object(store, "_save_locked") as save:
+                store.save_settings(store.settings)
+                store.save_track_details("track", details)
+                store.remove_track_details("missing")
+                store.set("custom", {"nested": [1]})
+                store.add_recent("search_history", "same")
+                store.save_downloads([])
+                self.assertEqual(store.favorite_tracks(["track", "track"]), 0)
+            save.assert_not_called()
+
+    def test_store_values_are_isolated_from_callers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = ApplicationStore(Path(directory) / "state.json")
+            value = {"nested": ["original"]}
+            store.set("custom", value)
+            value["nested"].append("external")
+            fetched = store.get("custom")
+            fetched["nested"].clear()
+            self.assertEqual(store.get("custom"), {"nested": ["original"]})
+
+            playback = {"queue": ["track"]}
+            store.record_play("track", played_at=1, playback=playback)
+            playback["queue"].clear()
+            self.assertEqual(store.get("playback"), {"queue": ["track"]})
+
+    def test_null_can_be_saved_under_a_new_key(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = ApplicationStore(Path(directory) / "state.json")
+            store.set("nullable", None)
+            restored = ApplicationStore(store.path)
+            self.assertIsNone(restored.get("nullable", "missing"))
+
+    def test_download_history_retains_only_latest_records_from_an_iterator(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = ApplicationStore(Path(directory) / "state.json")
+            records = [
+                DownloadRecord(id=str(i), url="", title=str(i)) for i in range(300)
+            ]
+            # Discarded records should never need serialization.
+            with patch.object(
+                records[0], "to_dict", side_effect=AssertionError("discarded")
+            ):
+                store.save_downloads(iter(records))
+            restored = ApplicationStore(store.path).downloads()
+            self.assertEqual(
+                [record.id for record in restored], [str(i) for i in range(50, 300)]
+            )
+
+    def test_failed_favorite_input_iteration_does_not_partially_update_state(
+        self,
+    ) -> None:
+        def track_ids():
+            yield "track"
+            raise ValueError("incomplete input")
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = ApplicationStore(Path(directory) / "state.json")
+            with self.assertRaisesRegex(ValueError, "incomplete input"):
+                store.favorite_tracks(track_ids())
+            self.assertEqual(store.get("track_details"), {})
+            self.assertFalse(store.path.exists())
+
 
 class ProviderMappingTests(unittest.TestCase):
+    def test_result_limit_does_not_consume_unused_lazy_entries(self) -> None:
+        def entries():
+            yield None
+            yield {"id": "one", "url": "one"}
+            raise AssertionError("Consumed beyond the requested result window")
+
+        results = _results_from_info({"entries": entries()}, "YouTube", limit=1)
+        self.assertEqual([result.id for result in results], ["one"])
+        self.assertEqual(
+            _results_from_info({"entries": entries()}, "YouTube", limit=0), []
+        )
+
+    def test_stream_resolution_uses_full_metadata_and_shared_overrides(self) -> None:
+        provider = YtDlpProvider(
+            yt_dlp_options={"socket_timeout": 30, "cookiefile": "cookies.txt"}
+        )
+        with patch("musicplayer.application.providers.YoutubeDL") as youtube_dl:
+            extractor = youtube_dl.return_value.__enter__.return_value
+            extractor.extract_info.return_value = {
+                "entries": [None, {"url": "https://media.test/audio"}]
+            }
+            self.assertEqual(
+                provider.resolve_stream("https://youtu.be/one"),
+                "https://media.test/audio",
+            )
+
+        options = youtube_dl.call_args.args[0]
+        self.assertEqual(options["format"], "bestaudio/best")
+        self.assertFalse(options["extract_flat"])
+        self.assertTrue(options["noplaylist"])
+        self.assertTrue(options["skip_download"])
+        self.assertEqual(options["socket_timeout"], 30)
+        self.assertEqual(options["cookiefile"], "cookies.txt")
+        self.assertIn("ffmpeg_location", options)
+
+    def test_all_provider_operations_translate_errors(self) -> None:
+        provider = YtDlpProvider()
+        operations = (
+            lambda: provider.search("music"),
+            lambda: provider.load_playlist("https://www.youtube.com/playlist?list=one"),
+            lambda: provider.resolve_stream("https://youtu.be/one"),
+        )
+        for operation in operations:
+            with (
+                self.subTest(operation=operation),
+                patch(
+                    "musicplayer.application.providers.YoutubeDL",
+                    side_effect=TimeoutError("timed out"),
+                ),
+                self.assertRaisesRegex(ProviderError, "YouTube took too long"),
+            ):
+                operation()
+
+    def test_stream_resolution_rejects_missing_audio_url(self) -> None:
+        with patch("musicplayer.application.providers.YoutubeDL") as youtube_dl:
+            youtube_dl.return_value.__enter__.return_value.extract_info.return_value = {}
+            with self.assertRaisesRegex(ProviderError, "playable audio stream"):
+                YtDlpProvider().resolve_stream("https://youtu.be/one")
+
     def test_default_registry_exposes_only_youtube(self) -> None:
         registry = ProviderRegistry()
 

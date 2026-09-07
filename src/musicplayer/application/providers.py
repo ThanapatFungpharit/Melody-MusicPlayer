@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from itertools import islice
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
@@ -82,63 +83,59 @@ class YtDlpProvider:
         result_offset = max(0, int(offset))
         is_url = _is_url(term)
         target = term if is_url else f"ytsearch{result_offset + result_limit}:{term}"
-        options: dict[str, Any] = {
-            **yt_dlp_binary_options(),
-            "quiet": True,
-            "no_warnings": True,
-            "skip_download": True,
-            "noplaylist": False,
-            "extract_flat": "in_playlist",
-            "playliststart": result_offset + 1,
-            "playlistend": result_offset + result_limit,
-            "socket_timeout": 12,
-            **(self.yt_dlp_options or {}),
-        }
-        try:
-            info = _extract_info(target, options)
-        except Exception as error:
-            raise ProviderError(_friendly_provider_error(error)) from error
+        info = self._extract(
+            target,
+            playliststart=result_offset + 1,
+            playlistend=result_offset + result_limit,
+        )
         return _results_from_info(info, self.name, limit=result_limit)
 
     def resolve_stream(self, url: str) -> str:
-        return _resolve_stream(url, self.yt_dlp_options)
+        info = self._extract(
+            url, format="bestaudio/best", noplaylist=True, extract_flat=False
+        )
+        if info and info.get("entries"):
+            info = next((entry for entry in info["entries"] if entry), None)
+        stream = str((info or {}).get("url") or "")
+        if not stream:
+            raise ProviderError("This result does not expose a playable audio stream.")
+        return stream
 
     def load_playlist(self, url: str) -> RemotePlaylist:
         source = url.strip()
         if not is_youtube_playlist_url(source):
             raise ProviderError("Paste a complete YouTube playlist URL.")
-        options: dict[str, Any] = {
-            **yt_dlp_binary_options(),
-            "quiet": True,
-            "no_warnings": True,
-            "skip_download": True,
-            "noplaylist": False,
-            "extract_flat": "in_playlist",
-            "socket_timeout": 12,
-            **(self.yt_dlp_options or {}),
-        }
-        try:
-            info = _extract_info(source, options)
-        except Exception as error:
-            raise ProviderError(_friendly_provider_error(error)) from error
+        info = self._extract(source)
         if not info or not _is_explicit_playlist_info(info):
             raise ProviderError("That URL did not resolve to a YouTube playlist.")
 
-        entries = [entry for entry in (info.get("entries") or []) if entry]
-        normalized_info = {**info, "entries": entries}
         tracks = tuple(
             result
-            for result in _results_from_info(
-                normalized_info,
-                self.name,
-                limit=max(1, len(entries)),
-            )
+            for result in _results_from_info(info, self.name)
             if result.url and is_youtube_url(result.url)
         )
         return RemotePlaylist(
             title=str(info.get("title") or "Imported YouTube playlist").strip(),
             tracks=tracks,
         )
+
+    def _extract(self, target: str, **options: Any) -> dict[str, Any] | None:
+        """Apply common metadata options and translate extraction failures."""
+        merged_options = {
+            **yt_dlp_binary_options(),
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+            "noplaylist": False,
+            "extract_flat": "in_playlist",
+            "socket_timeout": 12,
+            **options,
+            **(self.yt_dlp_options or {}),
+        }
+        try:
+            return _extract_info(target, merged_options)
+        except Exception as error:
+            raise ProviderError(_friendly_provider_error(error)) from error
 
 
 class ProviderRegistry:
@@ -185,7 +182,7 @@ def _is_explicit_playlist_info(info: dict[str, Any]) -> bool:
 
 
 def _results_from_info(
-    info: dict[str, Any] | None, source: str, *, limit: int
+    info: dict[str, Any] | None, source: str, *, limit: int | None = None
 ) -> list[SearchResult]:
     if not info:
         return []
@@ -198,9 +195,8 @@ def _results_from_info(
     raw_entries = entries if is_explicit_playlist else (entries or [info])
     is_youtube_source = source.casefold().startswith("youtube")
     results: list[SearchResult] = []
-    for entry in raw_entries or []:
-        if not entry or len(results) >= limit:
-            continue
+    valid_entries = (entry for entry in raw_entries or [] if entry)
+    for entry in islice(valid_entries, None if limit is None else max(0, limit)):
         url = str(entry.get("webpage_url") or entry.get("url") or "")
         if url and not _is_url(url) and is_youtube_source:
             url = f"https://www.youtube.com/watch?v={url}"
@@ -278,29 +274,6 @@ def _friendly_provider_error(error: Exception) -> str:
             "Netscape cookies.txt file in Settings, or remove it for anonymous access."
         )
     return public_error_message(message or "YouTube could not be searched.")
-
-
-def _resolve_stream(url: str, yt_dlp_options: dict[str, Any] | None = None) -> str:
-    options: dict[str, Any] = {
-        **yt_dlp_binary_options(),
-        "quiet": True,
-        "no_warnings": True,
-        "skip_download": True,
-        "format": "bestaudio/best",
-        "noplaylist": True,
-        "socket_timeout": 12,
-        **(yt_dlp_options or {}),
-    }
-    try:
-        info = _extract_info(url, options)
-    except Exception as error:
-        raise ProviderError(_friendly_provider_error(error)) from error
-    if info and info.get("entries"):
-        info = next((entry for entry in info["entries"] if entry), None)
-    stream = str((info or {}).get("url") or "")
-    if not stream:
-        raise ProviderError("This result does not expose a playable audio stream.")
-    return stream
 
 
 def _extract_info(target: str, options: dict[str, Any]) -> dict[str, Any] | None:

@@ -92,27 +92,30 @@ class LibraryService:
             # Registration and enriched metadata live in separate atomic
             # stores. Compensate if the second commit fails so callers never
             # receive an error while a half-imported track remains visible.
-            try:
-                self.manager.delete_track(track_id)
-            except Exception:
-                # Keep the copied file when registration rollback fails; the
-                # surviving track still references it and can be repaired.
-                logger.exception(
-                    "Could not roll back a local track after metadata save failure: "
-                    "track_id=%s",
-                    track_id,
-                )
-            else:
-                try:
-                    destination.unlink(missing_ok=True)
-                except OSError:
-                    logger.warning(
-                        "Could not remove a copied file after import rollback: path=%s",
-                        destination,
-                        exc_info=True,
-                    )
+            self._rollback_local_import(track_id, destination)
             raise
         return track_id
+
+    def _rollback_local_import(self, track_id: UUID, destination: Path) -> None:
+        try:
+            self.manager.delete_track(track_id)
+        except Exception:
+            # Keep the copied file when registration rollback fails; the
+            # surviving track still references it and can be repaired.
+            logger.exception(
+                "Could not roll back a local track after metadata save failure: "
+                "track_id=%s",
+                track_id,
+            )
+            return
+        try:
+            destination.unlink(missing_ok=True)
+        except OSError:
+            logger.warning(
+                "Could not remove a copied file after import rollback: path=%s",
+                destination,
+                exc_info=True,
+            )
 
     def _available_destination(self, name: str) -> Path:
         requested = Path(name)

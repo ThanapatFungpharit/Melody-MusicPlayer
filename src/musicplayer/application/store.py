@@ -4,8 +4,10 @@ import json
 import os
 import tempfile
 import threading
+from collections import deque
 from collections.abc import Iterable
 from copy import deepcopy
+from itertools import chain, islice
 from pathlib import Path
 from typing import Any
 
@@ -105,16 +107,7 @@ class ApplicationStore:
 
     def save_settings(self, settings: AppSettings) -> None:
         with self._lock:
-            value = settings.to_dict()
-            if self._data["settings"] == value:
-                return
-            previous = self._data["settings"]
-            self._data["settings"] = value
-            try:
-                self._save_locked()
-            except Exception:
-                self._data["settings"] = previous
-                raise
+            self._commit_locked({"settings": settings.to_dict()})
 
     def track_details(self, track_id: str) -> TrackDetails:
         with self._lock:
@@ -134,34 +127,11 @@ class ApplicationStore:
 
     def save_track_details(self, track_id: str, details: TrackDetails) -> None:
         with self._lock:
-            key = str(track_id)
-            value = details.to_dict()
-            if self._data["track_details"].get(key) == value:
-                return
-            details_by_track = self._data["track_details"]
-            previous = details_by_track.get(key, _MISSING)
-            details_by_track[key] = value
-            try:
-                self._save_locked()
-            except Exception:
-                if previous is _MISSING:
-                    details_by_track.pop(key, None)
-                else:
-                    details_by_track[key] = previous
-                raise
+            self._commit_locked({}, track_details={str(track_id): details.to_dict()})
 
     def remove_track_details(self, track_id: str) -> None:
         with self._lock:
-            details_by_track = self._data["track_details"]
-            key = str(track_id)
-            if key not in details_by_track:
-                return
-            previous = details_by_track.pop(key)
-            try:
-                self._save_locked()
-            except Exception:
-                details_by_track[key] = previous
-                raise
+            self._commit_locked({}, track_details={str(track_id): _MISSING})
 
     def clear_library_data(self) -> None:
         """Clear state that refers to library tracks, preserving other app data."""
@@ -182,19 +152,7 @@ class ApplicationStore:
                 "playback_history": [],
                 "playback": cleared_playback,
             }
-            if all(self._data.get(key) == value for key, value in replacements.items()):
-                return
-            previous = {key: self._data.get(key, _MISSING) for key in replacements}
-            self._data.update(replacements)
-            try:
-                self._save_locked()
-            except Exception:
-                for key, value in previous.items():
-                    if value is _MISSING:
-                        self._data.pop(key, None)
-                    else:
-                        self._data[key] = value
-                raise
+            self._commit_locked(replacements)
 
     def get(self, key: str, default: Any = None) -> Any:
         with self._lock:
@@ -202,33 +160,13 @@ class ApplicationStore:
 
     def set(self, key: str, value: Any) -> None:
         with self._lock:
-            copied = deepcopy(value)
-            if self._data.get(key) == copied:
-                return
-            previous = self._data.get(key, _MISSING)
-            self._data[key] = copied
-            try:
-                self._save_locked()
-            except Exception:
-                if previous is _MISSING:
-                    self._data.pop(key, None)
-                else:
-                    self._data[key] = previous
-                raise
+            self._commit_locked({key: deepcopy(value)})
 
     def add_recent(self, key: str, value: str, *, limit: int = 50) -> None:
         with self._lock:
-            previous = self._data.get(key, _MISSING)
-            if not self._add_recent_locked(key, value, limit=limit):
-                return
-            try:
-                self._save_locked()
-            except Exception:
-                if previous is _MISSING:
-                    self._data.pop(key, None)
-                else:
-                    self._data[key] = previous
-                raise
+            self._commit_locked(
+                {key: self._recent_items_locked(key, value, limit=limit)}
+            )
 
     def record_play(
         self,
@@ -237,40 +175,23 @@ class ApplicationStore:
         played_at: float,
         playback: dict[str, Any] | None = None,
     ) -> None:
-        """Update play metadata, histories, and optional session state atomically.
-
-        Playback used to save the details, recent list, and history list
-        separately. Combining them with the current queue snapshot keeps the
-        same crash-safe replace semantics while reducing a track start to one
-        serialization, fsync, and file replacement.
-        """
+        """Update play metadata, histories, and optional session state atomically."""
         key = str(track_id)
         with self._lock:
-            fields = ("recent_tracks", "playback_history", "playback")
-            previous = {name: self._data.get(name, _MISSING) for name in fields}
-            details_by_track = self._data["track_details"]
-            previous_details = details_by_track.get(key, _MISSING)
-            details = TrackDetails.from_dict(details_by_track.get(key, {}))
+            details = TrackDetails.from_dict(self._data["track_details"].get(key, {}))
             details.play_count += 1
             details.last_played = float(played_at)
-            details_by_track[key] = details.to_dict()
-            self._add_recent_locked("recent_tracks", key, limit=20)
-            self._add_recent_locked("playback_history", key, limit=100)
+            changes = {
+                "recent_tracks": self._recent_items_locked(
+                    "recent_tracks", key, limit=20
+                ),
+                "playback_history": self._recent_items_locked(
+                    "playback_history", key, limit=100
+                ),
+            }
             if playback is not None:
-                self._data["playback"] = deepcopy(playback)
-            try:
-                self._save_locked()
-            except Exception:
-                if previous_details is _MISSING:
-                    details_by_track.pop(key, None)
-                else:
-                    details_by_track[key] = previous_details
-                for name, value in previous.items():
-                    if value is _MISSING:
-                        self._data.pop(name, None)
-                    else:
-                        self._data[name] = value
-                raise
+                changes["playback"] = deepcopy(playback)
+            self._commit_locked(changes, track_details={key: details.to_dict()})
 
     def downloads(self) -> list[DownloadRecord]:
         with self._lock:
@@ -280,62 +201,66 @@ class ApplicationStore:
             ]
 
     def save_downloads(self, records: Iterable[DownloadRecord]) -> None:
-        value = [record.to_dict() for record in records]
-        if len(value) > 250:
-            value = value[-250:]
+        value = [record.to_dict() for record in deque(records, maxlen=250)]
         with self._lock:
-            if self._data.get("downloads") == value:
-                return
-            previous = self._data.get("downloads", _MISSING)
-            self._data["downloads"] = value
-            try:
-                self._save_locked()
-            except Exception:
-                if previous is _MISSING:
-                    self._data.pop("downloads", None)
-                else:
-                    self._data["downloads"] = previous
-                raise
+            self._commit_locked({"downloads": value})
 
     def favorite_tracks(self, track_ids: Iterable[str]) -> int:
         """Mark several tracks as favorites with one atomic state write."""
-        changed = 0
         with self._lock:
-            previous = self._data["track_details"]
-            details_by_track = previous
-            for track_id in track_ids:
-                key = str(track_id)
-                details = TrackDetails.from_dict(details_by_track.get(key, {}))
+            changes = {}
+            for key in dict.fromkeys(str(track_id) for track_id in track_ids):
+                details = TrackDetails.from_dict(
+                    self._data["track_details"].get(key, {})
+                )
                 if details.favorite:
                     continue
-                if details_by_track is previous:
-                    details_by_track = dict(previous)
                 details.favorite = True
-                details_by_track[key] = details.to_dict()
-                changed += 1
-            if changed:
-                self._data["track_details"] = details_by_track
-                try:
-                    self._save_locked()
-                except Exception:
-                    self._data["track_details"] = previous
-                    raise
-        return changed
+                changes[key] = details.to_dict()
+            self._commit_locked({}, track_details=changes)
+            return len(changes)
 
-    def _add_recent_locked(self, key: str, value: str, *, limit: int) -> bool:
-        items = self._data.get(key, [])
-        recent: list[str] = []
-        if limit > 0:
-            recent.append(value)
-            for item in items:
-                if item != value:
-                    recent.append(item)
-                    if len(recent) >= limit:
-                        break
-        if recent == items:
-            return False
-        self._data[key] = recent
-        return True
+    def _recent_items_locked(self, key: str, value: str, *, limit: int) -> list[str]:
+        remaining = (item for item in self._data.get(key, []) if item != value)
+        return list(islice(chain((value,), remaining), max(0, limit)))
+
+    def _commit_locked(
+        self,
+        changes: dict[str, Any],
+        *,
+        track_details: dict[str, Any] | None = None,
+    ) -> None:
+        """Persist replacements once, restoring changed entries on failure.
+
+        Callers hold the lock and supply owned values, never in-place mutations.
+        Snapshot only touched entries so updating a track needs no library copy.
+        _MISSING represents deletion as well as an absent previous value.
+        """
+        updates = [(self._data, changes)]
+        if track_details:
+            updates.append((self._data["track_details"], track_details))
+        previous = []
+        for target, replacements in updates:
+            for key, value in replacements.items():
+                old_value = target.get(key, _MISSING)
+                if old_value == value:
+                    continue
+                previous.append((target, key, old_value))
+                if value is _MISSING:
+                    target.pop(key, None)
+                else:
+                    target[key] = value
+        if not previous:
+            return
+        try:
+            self._save_locked()
+        except Exception:
+            for target, key, value in reversed(previous):
+                if value is _MISSING:
+                    target.pop(key, None)
+                else:
+                    target[key] = value
+            raise
 
     def _save_locked(self) -> None:
         # Compact JSON materially reduces bytes encoded and flushed for hot
