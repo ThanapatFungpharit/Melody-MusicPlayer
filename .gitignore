@@ -1,24 +1,49 @@
-# Python-generated files
+# Python bytecode, packaging output, and tool caches
 __pycache__/
 *.py[oc]
-.flet/
 .pytest_cache/
 .ruff_cache/
 build/
 dist/
 wheels/
-*.egg-info
+*.egg-info/
 
-# Virtual environments
-.venv
+# uv virtual environment
+.venv/
 
-# Local editor state
+# Flet and Flutter/Dart generated state
+.flet/
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+
+# Local environment and credentials (keep shareable templates)
+.env
+.env.*
+!.env.example
+!.env.template
+cookies.txt
+*.jks
+*.keystore
+
+# Local diagnostics and temporary files
+*.log
+*.tmp
+/ty_output.txt
+
+# Local editor and operating-system state
 .idea/
 .vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
 
-# Generated, platform-specific FFmpeg application resources
-src/musicplayer/bin/*/*/ffmpeg
-src/musicplayer/bin/*/*/ffprobe
-src/musicplayer/bin/*/*/ffmpeg.exe
-src/musicplayer/bin/*/*/ffprobe.exe
-src/musicplayer/bin/*/*/bundle.json
+# FFmpeg resources regenerated from tools/fetch_media_binaries.py
+# Keep other resources (such as licenses) visible to Git.
+/src/musicplayer/bin/*/*/ffmpeg
+/src/musicplayer/bin/*/*/ffprobe
+/src/musicplayer/bin/*/*/ffmpeg.exe
+/src/musicplayer/bin/*/*/ffprobe.exe
+/src/musicplayer/bin/*/*/bundle.json

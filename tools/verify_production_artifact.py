@@ -296,6 +296,13 @@ class ArtifactAudit:
             for path in files:
                 relative = path.relative_to(artifact).as_posix()
                 suffix = path.suffix.casefold()
+                if suffix in {".apk", ".aab"}:
+                    # Each installable must pass independently, even when CI
+                    # supplies a directory containing multiple ABI builds.
+                    config_start = len(self.release_configs)
+                    self.inspect_artifact(path)
+                    self.validate_release_config(config_start, str(path))
+                    continue
                 needs_data = (
                     relative.casefold().endswith("musicplayer/release.json")
                     or suffix in _ARCHIVE_SUFFIXES
@@ -317,13 +324,16 @@ class ArtifactAudit:
         if data is not None and zipfile.is_zipfile(io.BytesIO(data)):
             self.inspect_zip(data, str(artifact))
 
-    def validate_release_config(self) -> None:
-        if not self.release_configs:
+    def validate_release_config(
+        self, start_index: int = 0, display_path: str = "artifact"
+    ) -> None:
+        configs = self.release_configs[start_index:]
+        if not configs:
             self.violations.append(
-                "artifact: missing musicplayer/release.json production marker"
+                f"{display_path}: missing musicplayer/release.json production marker"
             )
             return
-        for path, config in self.release_configs:
+        for path, config in configs:
             if config != EXPECTED_RELEASE_CONFIG:
                 self.violations.append(
                     f"{path}: expected release settings "
@@ -337,8 +347,11 @@ def audit_artifacts(artifacts: Iterable[Path], project_file: Path) -> ArtifactAu
     )
     audit = ArtifactAudit(development_packages=development_packages)
     for artifact in artifacts:
+        config_start = len(audit.release_configs)
         audit.inspect_artifact(artifact)
-    audit.validate_release_config()
+        audit.validate_release_config(config_start, str(artifact))
+    if not audit.files_checked and not audit.violations:
+        audit.validate_release_config()
     return audit
 
 

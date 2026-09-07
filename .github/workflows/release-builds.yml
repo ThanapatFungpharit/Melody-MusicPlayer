@@ -76,11 +76,13 @@ jobs:
           uv run --frozen --no-dev --group build python
           tools/verify_production_artifact.py
           build/linux
+      - name: Archive Linux bundle with executable permissions
+        run: tar -czf build/melody-linux-x86_64.tar.gz -C build/linux .
       - name: Upload desktop bundle
         uses: actions/upload-artifact@v7
         with:
           name: melody-linux-x86_64
-          path: build/linux
+          path: build/melody-linux-x86_64.tar.gz
           if-no-files-found: error
 
   macos:
@@ -122,11 +124,13 @@ jobs:
           uv run --frozen --no-dev --group build python
           tools/verify_production_artifact.py
           build/macos
+      - name: Archive macOS bundle with permissions and symlinks
+        run: tar -czf build/melody-macos-${{ matrix.architecture }}.tar.gz -C build/macos .
       - name: Upload desktop bundle
         uses: actions/upload-artifact@v7
         with:
           name: melody-macos-${{ matrix.architecture }}
-          path: build/macos
+          path: build/melody-macos-${{ matrix.architecture }}.tar.gz
           if-no-files-found: error
 
   android:
@@ -222,11 +226,18 @@ jobs:
           cd artifacts
           for dir in */; do
             if [ -d "$dir" ]; then
-              zip -r "${dir%/}.zip" "$dir"
+              if [[ "$dir" == melody-linux-*/ || "$dir" == melody-macos-*/ ]]; then
+                cp "$dir"*.tar.gz .
+              else
+                zip -r "${dir%/}.zip" "$dir"
+              fi
             fi
           done
       - name: Publish to GitHub Releases
         uses: softprops/action-gh-release@v3
         with:
-          files: artifacts/*.zip
+          files: |
+            artifacts/*.zip
+            artifacts/*.tar.gz
+          fail_on_unmatched_files: true
           generate_release_notes: true

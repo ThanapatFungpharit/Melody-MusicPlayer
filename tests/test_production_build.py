@@ -299,6 +299,65 @@ class ProductionBuildTests(unittest.TestCase):
 
         self.assertIn("missing musicplayer/release.json", "\n".join(audit.violations))
 
+    def test_each_android_artifact_requires_its_own_production_marker(self) -> None:
+        for grouped in (False, True):
+            for invalid_suffix in ("apk", "aab"):
+                with (
+                    self.subTest(grouped=grouped, invalid_suffix=invalid_suffix),
+                    tempfile.TemporaryDirectory() as directory,
+                ):
+                    root = Path(directory)
+                    valid = root / "valid.apk"
+                    invalid = root / f"invalid.{invalid_suffix}"
+                    valid.write_bytes(
+                        _zip_bytes(
+                            {
+                                "assets/app.zip": _zip_bytes(
+                                    {
+                                        "musicplayer/release.json": json.dumps(
+                                            EXPECTED_RELEASE_CONFIG
+                                        ).encode(),
+                                    }
+                                ),
+                            }
+                        )
+                    )
+                    invalid.write_bytes(_zip_bytes({"main.pyc": b"compiled"}))
+
+                    audit = audit_artifacts(
+                        [root] if grouped else [valid, invalid], Path("pyproject.toml")
+                    )
+
+                    self.assertTrue(
+                        any(
+                            invalid.name in violation
+                            and "missing musicplayer/release.json" in violation
+                            for violation in audit.violations
+                        ),
+                        audit.violations,
+                    )
+
+    def test_each_desktop_bundle_requires_its_own_production_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            valid = root / "valid" / "musicplayer"
+            valid.mkdir(parents=True)
+            (valid / "release.json").write_text(json.dumps(EXPECTED_RELEASE_CONFIG))
+            invalid = root / "invalid"
+            invalid.mkdir()
+            (invalid / "main.pyc").write_bytes(b"compiled")
+
+            audit = audit_artifacts([valid.parent, invalid], Path("pyproject.toml"))
+
+        self.assertTrue(
+            any(
+                "invalid" in violation
+                and "missing musicplayer/release.json" in violation
+                for violation in audit.violations
+            ),
+            audit.violations,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
