@@ -85,11 +85,15 @@ jobs:
 
   macos:
     environment: production
-    runs-on: macos-latest
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
-        architecture: [x86_64, arm64]
+        include:
+          - architecture: x86_64
+            runner: macos-15-intel
+          - architecture: arm64
+            runner: macos-15
     env:
       MELODY_ENV: production
       MELODY_DEBUG: "0"
@@ -180,25 +184,25 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: melody-android-arm64-v8a
-          path: build/apk/*-arm64-v8a-*.apk
+          path: build/apk/melody-arm64-v8a.apk
           if-no-files-found: error
       - name: Upload Android armeabi-v7a APK
         uses: actions/upload-artifact@v7
         with:
           name: melody-android-armeabi-v7a
-          path: build/apk/*-armeabi-v7a-*.apk
+          path: build/apk/melody-armeabi-v7a.apk
           if-no-files-found: error
       - name: Upload Android x86_64 APK
         uses: actions/upload-artifact@v7
         with:
           name: melody-android-x86_64
-          path: build/apk/*-x86_64-*.apk
+          path: build/apk/melody-x86_64.apk
           if-no-files-found: error
       - name: Upload Android App Bundle
         uses: actions/upload-artifact@v7
         with:
           name: melody-android-aab
-          path: build/aab/*.aab
+          path: build/aab/melody.aab
           if-no-files-found: error
 
   release:

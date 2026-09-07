@@ -109,11 +109,11 @@ uv run python tools/build_desktop.py macos --architecture x86_64 -- --yes
 uv run python tools/build_desktop.py macos --architecture arm64 -- --yes
 ```
 
-The release workflow builds separate Intel and Apple Silicon macOS bundles and
-uploads every desktop bundle with its architecture in the artifact name.
-Generated binaries are deliberately kept out of Git; every distributable
-artifact obtains them from the pinned, checksum-verified manifest in
-`tools/fetch_media_binaries.py`.
+The release workflow builds separate Intel and Apple Silicon macOS bundles on
+matching native runners and uploads every desktop bundle with its architecture
+in the artifact name. Generated binaries are deliberately kept out of Git;
+every distributable artifact obtains them from the pinned, checksum-verified
+manifest in `tools/fetch_media_binaries.py`.
 
 ## Android bundles
 
