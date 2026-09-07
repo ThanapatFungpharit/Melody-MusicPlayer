@@ -97,6 +97,8 @@ jobs:
           - architecture: arm64
             runner: macos-15
     env:
+      # connectivity_plus 7.3.1 requires Xcode >= 26.1.1; runners default to 16.4.
+      DEVELOPER_DIR: /Applications/Xcode_26.2.app/Contents/Developer
       MELODY_ENV: production
       MELODY_DEBUG: "0"
       FLET_DEBUG: "0"
@@ -110,6 +112,10 @@ jobs:
         with:
           enable-cache: true
           cache-suffix: ${{ matrix.architecture }}
+      - name: Verify macOS toolchain
+        run: |
+          xcodebuild -version
+          xcrun --sdk macosx --show-sdk-version
       - name: Install isolated release toolchain
         run: uv sync --frozen --no-dev --group build
       - name: Build desktop bundle
@@ -119,6 +125,17 @@ jobs:
           macos
           --architecture ${{ matrix.architecture }}
           -- --yes
+      - name: Verify macOS binary architecture
+        env:
+          EXPECTED_ARCH: ${{ matrix.architecture }}
+        run: |
+          bundle="build/macos/melody.app"
+          executable=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$bundle/Contents/Info.plist")
+          actual_arch=$(xcrun lipo -archs "$bundle/Contents/MacOS/$executable")
+          if [ "$actual_arch" != "$EXPECTED_ARCH" ]; then
+            echo "Expected $EXPECTED_ARCH app, found: $actual_arch" >&2
+            exit 1
+          fi
       - name: Verify production artifact
         run: >-
           uv run --frozen --no-dev --group build python

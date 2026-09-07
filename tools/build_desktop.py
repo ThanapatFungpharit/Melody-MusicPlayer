@@ -55,11 +55,12 @@ def main() -> None:
         str(PROJECT_ROOT),
     ]
     if arguments.target == "macos":
-        flet_architectures = [
-            "x64" if architecture == "x86_64" else "arm64"
-            for architecture in architectures
-        ]
-        command.extend(("--arch", *flet_architectures))
+        # Flet forwards these names to serious_python, whose Darwin package
+        # targets are x86_64 and arm64 (not Flutter's x64 alias).
+        command.extend(("--arch", *architectures))
+        # Flutter defaults release builds to universal binaries. Match the
+        # native app to the Python packages and FFmpeg resources prepared above.
+        build_environment["FLUTTER_XCODE_ARCHS"] = " ".join(architectures)
     command.extend(extra)
     subprocess.run(
         command,

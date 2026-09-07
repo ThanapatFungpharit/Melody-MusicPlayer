@@ -111,7 +111,12 @@ uv run python tools/build_desktop.py macos --architecture arm64 -- --yes
 
 The release workflow builds separate Intel and Apple Silicon macOS bundles on
 matching native runners and uploads every desktop bundle with its architecture
-in the artifact name. Generated binaries are deliberately kept out of Git;
+in the artifact name. macOS builds require Xcode 26.1.1 or newer for the native
+connectivity plugin; CI selects Xcode 26.2 explicitly. The desktop wrapper keeps
+the Python package, Xcode, and FFmpeg architectures aligned, and CI checks the
+resulting macOS executable before upload.
+
+Generated binaries are deliberately kept out of Git;
 every distributable artifact obtains them from the pinned, checksum-verified
 manifest in `tools/fetch_media_binaries.py`.
 
