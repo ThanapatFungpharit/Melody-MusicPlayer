@@ -7,7 +7,28 @@ on:
       - "v*"
 
 jobs:
+  validate-ui:
+    name: Validate shared logic and platform UIs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v9.0.0
+        with:
+          enable-cache: true
+          cache-suffix: ui-validation
+      - name: Install validation tools for the packaged Python version
+        run: uv sync --frozen --python 3.13 --group build --group dev
+      - name: Test both UIs, including isolated compiled packages
+        run: uv run --frozen --python 3.13 --group build --group dev python -m unittest discover -s tests -v
+      - name: Lint and check formatting
+        run: |
+          uv run --frozen --python 3.13 --group build --group dev ruff check src tests tools
+          uv run --frozen --python 3.13 --group build --group dev ruff format --check src tests tools
+      - name: Check types
+        run: uv run --frozen --python 3.13 --group build --group dev ty check src tests tools
+
   windows:
+    needs: validate-ui
     environment: production
     runs-on: windows-latest
     env:
@@ -36,6 +57,7 @@ jobs:
         run: >-
           uv run --frozen --no-dev --group build python
           tools/verify_production_artifact.py
+          --target windows
           build/windows
       - name: Upload desktop bundle
         uses: actions/upload-artifact@v7
@@ -45,6 +67,7 @@ jobs:
           if-no-files-found: error
 
   linux:
+    needs: validate-ui
     environment: production
     runs-on: ubuntu-latest
     env:
@@ -75,6 +98,7 @@ jobs:
         run: >-
           uv run --frozen --no-dev --group build python
           tools/verify_production_artifact.py
+          --target linux
           build/linux
       - name: Archive Linux bundle with executable permissions
         run: tar -czf build/melody-linux-x86_64.tar.gz -C build/linux .
@@ -86,6 +110,7 @@ jobs:
           if-no-files-found: error
 
   macos:
+    needs: validate-ui
     environment: production
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -140,6 +165,7 @@ jobs:
         run: >-
           uv run --frozen --no-dev --group build python
           tools/verify_production_artifact.py
+          --target macos
           build/macos
       - name: Archive macOS bundle with permissions and symlinks
         run: tar -czf build/melody-macos-${{ matrix.architecture }}.tar.gz -C build/macos .
@@ -151,6 +177,7 @@ jobs:
           if-no-files-found: error
 
   android:
+    needs: validate-ui
     environment: production
     runs-on: ubuntu-latest
     env:
@@ -197,10 +224,9 @@ jobs:
           uv run --frozen --no-dev --group build python -m tools.build_android aab
           -- --yes
       - name: Verify production artifacts
-        run: >-
-          uv run --frozen --no-dev --group build python
-          tools/verify_production_artifact.py
-          build/apk build/aab
+        run: |
+          uv run --frozen --no-dev --group build python tools/verify_production_artifact.py --target apk build/apk
+          uv run --frozen --no-dev --group build python tools/verify_production_artifact.py --target aab build/aab
       - name: Upload Android arm64-v8a APK
         uses: actions/upload-artifact@v7
         with:

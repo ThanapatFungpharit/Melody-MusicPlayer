@@ -672,6 +672,24 @@ class MusicManager:
         logger.debug("Resolved track path: track_id=%s path=%s", track_id, path)
         return path
 
+    def is_path_referenced(
+        self, filename: str | Path, *, excluding: UUID | str | None = None
+    ) -> bool:
+        """Return whether another library record still owns *filename*.
+
+        Files are normally canonical because imports deduplicate by content, but
+        this guard also makes cleanup safe for older metadata or manually repaired
+        libraries where two records may point at the same managed file.
+        """
+        target = Path(filename).resolve()
+        excluded = _as_uuid(excluding) if excluding is not None else None
+        with self._lock:
+            return any(
+                track.id != excluded
+                and self._path_for_filename(track.filename).resolve() == target
+                for track in self._tracks.values()
+            )
+
     # -- integrity ---------------------------------------------------
     def check_track_integrity(self, track_id: UUID | str) -> IntegrityProblem | None:
         logger.debug("Checking track integrity: track_id=%s", track_id)

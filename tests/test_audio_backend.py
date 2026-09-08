@@ -28,6 +28,16 @@ class FakePage:
 
 
 class FletAudioBackendTests(unittest.TestCase):
+    def test_phone_gain_uses_system_volume_while_desktop_keeps_precise_gain(self):
+        for mobile, expected in ((True, 1.0), (False, 0.25)):
+            backend = FletAudioBackend(FakePage(), use_device_volume=mobile)  # ty: ignore[invalid-argument-type]
+            backend.set_volume(0.25)
+            self.assertEqual(backend._volume, expected)
+            backend.set_volume(0)
+            self.assertEqual(backend._volume, 0)
+            backend.set_volume(0.25)
+            self.assertEqual(backend._volume, expected)
+
     def test_play_waits_for_loaded_event_and_operations_use_page_loop(self) -> None:
         page = FakePage()
         backend = FletAudioBackend(page)  # type: ignore[arg-type]  # ty: ignore[invalid-argument-type]

@@ -13,12 +13,9 @@ from musicplayer.application.models import SearchResult
 from musicplayer.application.providers import YOUTUBE_PROVIDER_ID, ProviderError
 from musicplayer.core.library.models import Playlist
 from musicplayer.ui.components.common import (
-    _artwork,
     _empty_state,
     _format_duration,
-    _page_header,
 )
-from musicplayer.ui.theme import card
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +33,7 @@ class SearchPage(_Base):
     SEARCH_PAGE_SIZE = 24
 
     def _initialize_search_page(self) -> None:
+        self.search_draft = ""
         self.search_results: list[SearchResult] = []
         self.search_busy = False
         self.search_page = 1
@@ -45,107 +43,7 @@ class SearchPage(_Base):
         self.search_view_mode = "list"
 
     def _search_view(self) -> ft.Control:
-        self.search_query = ft.TextField(
-            value=self.search_query_text,
-            hint_text="Search YouTube songs, channels, or playlists — or paste a YouTube URL",
-            prefix_icon=ft.Icons.SEARCH_ROUNDED,
-            border_radius=16,
-            expand=True,
-            on_submit=lambda _: self._start_search(),
-        )
-        self.search_button = ft.Button(
-            "Search",
-            icon=ft.Icons.SEARCH_ROUNDED,
-            on_click=lambda _: self._start_search(),
-        )
-        self.batch_download_button = ft.Button(
-            "Batch URLs",
-            icon=ft.Icons.DOWNLOAD_ROUNDED,
-            on_click=lambda _: self._batch_download_dialog(),
-        )
-        self.search_query.col = {"xs": 12, "md": 8}
-        self.search_button.col = {"xs": 12, "md": 2}
-        self.batch_download_button.col = {"xs": 12, "md": 2}
-        self.search_status = ft.Text(
-            "Search YouTube or inspect a YouTube video or playlist URL.",
-            color=ft.Colors.ON_SURFACE_VARIANT,
-            col={"xs": 12, "md": 7},
-        )
-        self.search_view_selector = ft.SegmentedButton(
-            segments=[
-                ft.Segment("list", icon=ft.Icons.VIEW_LIST_ROUNDED, label="Track list"),
-                ft.Segment("grid", icon=ft.Icons.GRID_VIEW_ROUNDED, label="Grid"),
-            ],
-            selected=[self.search_view_mode],
-            show_selected_icon=False,
-            on_change=lambda event: self._set_search_view(event.control.selected),
-            col={"xs": 12, "md": 5},
-        )
-        self.search_previous_button = ft.IconButton(
-            ft.Icons.CHEVRON_LEFT_ROUNDED,
-            tooltip="Previous page",
-            disabled=self.search_page <= 1,
-            on_click=lambda _: self._load_search_page(self.search_page - 1),
-        )
-        self.search_first_button = ft.TextButton(
-            "First",
-            disabled=self.search_page <= 1,
-            on_click=lambda _: self._load_search_page(1),
-        )
-        self.search_page_label = ft.Text(
-            f"Page {self.search_page}", weight=ft.FontWeight.W_600
-        )
-        self.search_next_button = ft.IconButton(
-            ft.Icons.CHEVRON_RIGHT_ROUNDED,
-            tooltip="Next page",
-            disabled=not self.search_has_next,
-            on_click=lambda _: self._load_search_page(self.search_page + 1),
-        )
-        self.search_pagination = ft.Row(
-            [
-                self.search_first_button,
-                self.search_previous_button,
-                self.search_page_label,
-                self.search_next_button,
-            ],
-            alignment=ft.MainAxisAlignment.CENTER,
-            spacing=6,
-            visible=bool(self.search_results) or self.search_page > 1,
-        )
-        self.search_list = ft.Column(spacing=10)
-        if self.search_results:
-            self._render_search_results(update=False)
-            self._update_search_navigation()
-        else:
-            self.search_list.controls = [
-                _empty_state(
-                    ft.Icons.TRAVEL_EXPLORE_ROUNDED,
-                    "Start with a song, channel, playlist, or YouTube URL.",
-                )
-            ]
-        return ft.Column(
-            [
-                _page_header("Search", "Find music on YouTube."),
-                self._responsive_grid(
-                    [
-                        self.search_query,
-                        self.search_button,
-                        self.batch_download_button,
-                    ],
-                    spacing=12,
-                ),
-                self._responsive_grid(
-                    [self.search_status, self.search_view_selector],
-                    spacing=10,
-                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                ),
-                ft.Divider(height=1),
-                ft.Column([self.search_list], scroll=ft.ScrollMode.AUTO, expand=True),
-                self.search_pagination,
-            ],
-            spacing=16,
-            expand=True,
-        )
+        return self.views._search_view(self)
 
     def _start_search(self) -> None:
         query = self.search_query.value.strip()
@@ -184,9 +82,7 @@ class SearchPage(_Base):
                 self.page.update(validation)
                 return
             self.page.pop_dialog()
-            self._show_message(
-                f"Started a batch of {batch.size} songs. Each song will continue independently."
-            )
+            self._show_message(self._batch_download_message(batch))
             self._open_downloads_panel()
 
         self.page.show_dialog(
@@ -224,10 +120,20 @@ class SearchPage(_Base):
         except (ValueError, OSError, RuntimeError) as error:
             self._show_error(str(error))
             return
-        self._show_message(
-            f"Started a batch of {batch.size} songs. Each song will continue independently."
-        )
+        self._show_message(self._batch_download_message(batch))
         self._open_downloads_panel()
+
+    @staticmethod
+    def _batch_download_message(batch) -> str:
+        scheduled = len(batch.tasks)
+        if scheduled == batch.size:
+            return f"Started a batch of {batch.size} songs. Each song will continue independently."
+        if scheduled:
+            return (
+                f"Queued {scheduled} of {batch.size} songs. Existing files and active "
+                "downloads were reused."
+            )
+        return "All requested songs are already in the library or downloading."
 
     def _load_search_page(self, page: int) -> None:
         if self.search_busy or page < 1:
@@ -348,25 +254,8 @@ class SearchPage(_Base):
                     ft.Icons.SEARCH_OFF_ROUNDED, "No matching music was found."
                 )
             ]
-        elif self.search_view_mode == "grid":
-            playlists = self.manager.list_playlists()
-            self.search_list.controls = [
-                ft.Row(
-                    [
-                        self._search_result_card(item, playlists)
-                        for item in self.search_results
-                    ],
-                    wrap=True,
-                    spacing=14,
-                    run_spacing=14,
-                    vertical_alignment=ft.CrossAxisAlignment.START,
-                )
-            ]
         else:
-            playlists = self.manager.list_playlists()
-            self.search_list.controls = [
-                self._search_result_row(item, playlists) for item in self.search_results
-            ]
+            self.search_list.controls = self.views._search_results(self)
         if update:
             self.page.update(self.search_list)
 
@@ -400,183 +289,55 @@ class SearchPage(_Base):
     def _search_result_row(
         self, result: SearchResult, playlists: tuple[Playlist, ...]
     ) -> ft.Control:
-        subtitle = f"{result.uploader}  •  {result.source}"
-        if result.is_playlist:
-            subtitle += f"  •  {result.entry_count or 'Multiple'} tracks"
-        elif result.duration:
-            subtitle += f"  •  {_format_duration(result.duration)}"
-        local_track = (
-            None
-            if result.is_playlist
-            else self.manager.find_track_by_source(result.url)
-        )
-        menu_items = self._search_result_menu(result, playlists)
-        compact = self.compact_layout
-        actions: list[ft.Control] = (
-            [
-                ft.PopupMenuButton(
-                    icon=ft.Icons.MORE_HORIZ_ROUNDED,
-                    tooltip="Actions",
-                    items=menu_items,
-                )
-            ]
-            if compact
-            else [
-                ft.IconButton(
-                    ft.Icons.PLAY_ARROW_ROUNDED,
-                    tooltip="Play now",
-                    on_click=lambda _, item=result: self._play_search_result(item),
-                ),
-                ft.IconButton(
-                    ft.Icons.DOWNLOAD_DONE_ROUNDED
-                    if local_track
-                    else ft.Icons.DOWNLOAD_ROUNDED,
-                    tooltip="Already in library" if local_track else "Download",
-                    disabled=bool(local_track),
-                    on_click=lambda _, item=result: self._download_result(item),
-                ),
-                ft.PopupMenuButton(
-                    icon=ft.Icons.MORE_HORIZ_ROUNDED,
-                    tooltip="More actions",
-                    items=menu_items,
-                ),
-            ]
-        )
-        return card(
-            ft.Row(
-                [
-                    _artwork(result.thumbnail, 64, playlist=result.is_playlist),
-                    ft.Column(
-                        [
-                            ft.Text(
-                                result.title, weight=ft.FontWeight.W_600, max_lines=1
-                            ),
-                            ft.Text(
-                                subtitle,
-                                size=12,
-                                color=ft.Colors.ON_SURFACE_VARIANT,
-                                max_lines=1,
-                            ),
-                        ],
-                        spacing=5,
-                        expand=True,
-                    ),
-                    *actions,
-                ],
-                vertical_alignment=ft.CrossAxisAlignment.CENTER,
-            ),
-            padding=12,
-        )
+        return self.views._search_result_row(self, result, playlists)
 
     def _search_result_card(
         self, result: SearchResult, playlists: tuple[Playlist, ...]
     ) -> ft.Control:
-        local_track = (
-            None
-            if result.is_playlist
-            else self.manager.find_track_by_source(result.url)
-        )
-        detail = result.uploader or "Unknown uploader"
+        return self.views._search_result_card(self, result, playlists)
+
+    def _available_search_track(self, result: SearchResult):
+        """Resolve the canonical intact local track for a search result."""
         if result.is_playlist:
-            detail += f" • {result.entry_count or 'Multiple'} tracks"
-        elif result.duration:
-            detail += f" • {_format_duration(result.duration)}"
-        compact = self.compact_layout
-        art_size = 150 if compact else 220
-        card_width = 180 if compact else 260
-        return ft.Container(
-            card(
-                ft.Column(
-                    [
-                        _artwork(
-                            result.thumbnail, art_size, playlist=result.is_playlist
-                        ),
-                        ft.Text(
-                            result.title,
-                            weight=ft.FontWeight.BOLD,
-                            max_lines=2,
-                            height=40 if compact else 44,
-                            size=13 if compact else 14,
-                        ),
-                        ft.Text(
-                            detail,
-                            size=11 if compact else 12,
-                            color=ft.Colors.ON_SURFACE_VARIANT,
-                            max_lines=1,
-                        ),
-                        ft.Row(
-                            [
-                                ft.IconButton(
-                                    ft.Icons.PLAY_ARROW_ROUNDED,
-                                    tooltip="Play now",
-                                    icon_size=20 if compact else 24,
-                                    on_click=lambda _, item=result: (
-                                        self._play_search_result(item)
-                                    ),
-                                ),
-                                ft.IconButton(
-                                    ft.Icons.DOWNLOAD_DONE_ROUNDED
-                                    if local_track
-                                    else ft.Icons.DOWNLOAD_ROUNDED,
-                                    tooltip=(
-                                        "Already in library"
-                                        if local_track
-                                        else "Download"
-                                    ),
-                                    icon_size=20 if compact else 24,
-                                    disabled=bool(local_track),
-                                    on_click=lambda _, item=result: (
-                                        self._download_result(item)
-                                    ),
-                                ),
-                                ft.Container(expand=True),
-                                ft.PopupMenuButton(
-                                    icon=ft.Icons.MORE_HORIZ_ROUNDED,
-                                    tooltip="More actions",
-                                    items=self._search_result_menu(
-                                        result,
-                                        playlists,
-                                        include_primary_actions=False,
-                                    ),
-                                ),
-                            ]
-                        ),
-                    ],
-                    spacing=6 if compact else 8,
-                ),
-                padding=10 if compact else 12,
-            ),
-            width=card_width,
-        )
+            return None
+        resolver = getattr(getattr(self, "downloads", None), "available_track", None)
+        if resolver is not None:
+            return resolver(result.url)
+        existing = self.manager.find_track_by_source(result.url)
+        if existing is None:
+            return None
+        try:
+            return (
+                existing
+                if self.manager.check_track_integrity(existing.id) is None
+                else None
+            )
+        except (KeyError, OSError, ValueError):
+            return None
 
     def _search_result_menu(
         self,
         result: SearchResult,
         playlists: tuple[Playlist, ...],
         *,
-        include_primary_actions: bool | None = None,
+        include_primary_actions: bool = False,
     ) -> list[ft.PopupMenuItem]:
         menu_items: list[ft.PopupMenuItem] = []
-        show_primary_actions = (
-            self.compact_layout
-            if include_primary_actions is None
-            else include_primary_actions
-        )
-        if show_primary_actions:
-            menu_items.extend(
-                [
-                    ft.PopupMenuItem(
-                        content="Play now",
-                        icon=ft.Icons.PLAY_ARROW_ROUNDED,
-                        on_click=lambda _, item=result: self._play_search_result(item),
-                    ),
-                    ft.PopupMenuItem(
-                        content="Download",
-                        icon=ft.Icons.DOWNLOAD_ROUNDED,
-                        on_click=lambda _, item=result: self._download_result(item),
-                    ),
-                ]
+        local_track = self._available_search_track(result)
+        if include_primary_actions and local_track is None:
+            menu_items.append(
+                ft.PopupMenuItem(
+                    content=("Download playlist" if result.is_playlist else "Download"),
+                    icon=ft.Icons.DOWNLOAD_ROUNDED,
+                    on_click=lambda _, item=result: self._download_result(item),
+                )
             )
+        known_track = local_track or (
+            None
+            if result.is_playlist
+            else self.manager.find_track_by_source(result.url)
+        )
+        favorite = bool(known_track and self.library.details(known_track.id).favorite)
         menu_items.extend(
             [
                 ft.PopupMenuItem(
@@ -594,7 +355,7 @@ class SearchPage(_Base):
                     ),
                 ),
                 ft.PopupMenuItem(
-                    content="Favorite",
+                    content="Remove favorite" if favorite else "Favorite",
                     icon=ft.Icons.FAVORITE_BORDER_ROUNDED,
                     on_click=lambda _, item=result: self._act_on_search_result(
                         item, "favorite"
@@ -628,10 +389,17 @@ class SearchPage(_Base):
         after: str = "",
         playlist_id: str | None = None,
     ) -> None:
+        active_check = getattr(self.downloads, "is_source_active", None)
+        was_active = bool(active_check and active_check(result.url))
         try:
-            task = self.downloads.start(result)
+            requester = getattr(self.downloads, "request", None)
+            task = (
+                requester(result)
+                if requester is not None
+                else self.downloads.start(result)
+            )
         except DuplicateDownloadError as error:
-            existing = self.manager.find_track_by_source(result.url)
+            existing = self._available_search_track(result)
             if existing and after:
                 self._apply_track_action([str(existing.id)], after, playlist_id)
             else:
@@ -639,6 +407,13 @@ class SearchPage(_Base):
         except (ValueError, OSError, RuntimeError) as error:
             self._show_error(str(error))
         else:
+            if task is None:
+                existing = self._available_search_track(result)
+                if existing and after:
+                    self._apply_track_action([str(existing.id)], after, playlist_id)
+                elif existing:
+                    self._show_message("This track is already in your library.")
+                return
             if after:
                 self.pending_download_actions[str(task.id)] = (after, playlist_id)
                 record = self.downloads.get(str(task.id))
@@ -650,18 +425,22 @@ class SearchPage(_Base):
                 "queue": " It will join the queue when ready.",
                 "playlist": " It will be added to the playlist when ready.",
             }.get(after, "")
-            self._show_message(f"Downloading {noun}.{follow_up}")
+            prefix = "Download already in progress for" if was_active else "Downloading"
+            self._show_message(f"{prefix} {noun}.{follow_up}")
 
     def _act_on_search_result(
         self, result: SearchResult, action: str, playlist_id: str | None = None
     ) -> None:
-        existing = (
-            None
-            if result.is_playlist
-            else self.manager.find_track_by_source(result.url)
-        )
+        existing = self._available_search_track(result)
+        if existing is None and action == "favorite" and not result.is_playlist:
+            # Favoriting is metadata-only, so it remains useful for a known
+            # record even while its managed file is awaiting repair.
+            existing = self.manager.find_track_by_source(result.url)
         if existing:
-            self._apply_track_action([str(existing.id)], action, playlist_id)
+            if action == "favorite":
+                self._toggle_favorite(str(existing.id))
+            else:
+                self._apply_track_action([str(existing.id)], action, playlist_id)
             return
         self._download_result(result, after=action, playlist_id=playlist_id)
 
@@ -733,9 +512,20 @@ class SearchPage(_Base):
         )
 
     def _play_search_result(self, result: SearchResult) -> None:
+        if not result.is_playlist:
+            existing = self._available_search_track(result)
+            if existing is not None:
+                self.playback.play_track(str(existing.id))
+                return
+            self._download_result(result, after="play")
+            return
+
+        # A playlist search result is a container, not a single library track.
+        # Keep the useful lightweight preview interaction, and make that intent
+        # explicit in the platform-specific label.
         provider_id = result.provider_id
         if self._submit_background(self._resolve_and_play, provider_id, result):
-            self._show_message(f"Preparing “{result.title}”…")
+            self._show_message(f"Previewing “{result.title}”…")
 
     def _resolve_and_play(self, provider_id: str, result: SearchResult) -> None:
         try:
@@ -748,3 +538,6 @@ class SearchPage(_Base):
             )
         except ProviderError as error:
             self._show_error(str(error))
+
+    def _search_draft_changed(self, event) -> None:
+        self.search_draft = event.control.value or ""

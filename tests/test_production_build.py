@@ -19,9 +19,11 @@ from musicplayer.runtime_environment import (
 from tools import build_android, build_desktop
 from tools.production_build import (
     RELEASE_PYTHON_VERSION,
+    TARGET_PRESENTATIONS,
     hardened_flet_arguments,
     production_build_environment,
     production_process_environment,
+    required_ui_modules,
     validate_android_release_signing,
 )
 from tools.verify_production_artifact import (
@@ -36,6 +38,16 @@ def _zip_bytes(files: dict[str, bytes]) -> bytes:
         for name, contents in files.items():
             archive.writestr(name, contents)
     return output.getvalue()
+
+
+def _ui_payload(presentation: str) -> dict[str, bytes]:
+    return {
+        "musicplayer/release.json": json.dumps(EXPECTED_RELEASE_CONFIG).encode(),
+        **{
+            f"musicplayer/{module}": b"compiled"
+            for module in required_ui_modules(Path("pyproject.toml"), presentation)
+        },
+    }
 
 
 class ProductionBuildTests(unittest.TestCase):
@@ -231,6 +243,96 @@ class ProductionBuildTests(unittest.TestCase):
             audit = audit_artifacts([artifact], Path("pyproject.toml"))
 
         self.assertEqual(audit.violations, [])
+
+    def test_artifact_audit_accepts_each_targets_complete_ui(self) -> None:
+        for target, presentation in TARGET_PRESENTATIONS.items():
+            with (
+                self.subTest(target=target),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                artifact = Path(directory) / f"{target}.zip"
+                artifact.write_bytes(
+                    _zip_bytes(
+                        {"assets/app.zip": _zip_bytes(_ui_payload(presentation))}
+                    )
+                )
+                audit = audit_artifacts(
+                    [artifact], Path("pyproject.toml"), target=target
+                )
+                self.assertEqual(audit.violations, [])
+
+    def test_artifact_audit_rejects_the_opposite_presentation(self) -> None:
+        for target, presentation, opposite in (
+            ("windows", "desktop", "mobile"),
+            ("apk", "mobile", "desktop"),
+        ):
+            with (
+                self.subTest(target=target),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                payload = _ui_payload(presentation)
+                payload[f"musicplayer/ui/{opposite}/shell.pyc"] = b"compiled"
+                artifact = Path(directory) / "app.zip"
+                artifact.write_bytes(_zip_bytes(payload))
+                audit = audit_artifacts(
+                    [artifact], Path("pyproject.toml"), target=target
+                )
+                self.assertIn(f"unexpected {opposite} UI", "\n".join(audit.violations))
+
+    def test_artifact_audit_requires_platform_and_shared_ui_modules(self) -> None:
+        for missing in (
+            "ui/mobile/shell.pyc",
+            "ui/mobile/insets.pyc",
+            "ui/pages/settings.pyc",
+            "ui/components/player_bar.pyc",
+            "ui/presentation.pyc",
+        ):
+            with (
+                self.subTest(missing=missing),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                payload = _ui_payload("mobile")
+                del payload[f"musicplayer/{missing}"]
+                artifact = Path(directory) / "app.zip"
+                artifact.write_bytes(_zip_bytes(payload))
+                audit = audit_artifacts(
+                    [artifact], Path("pyproject.toml"), target="aab"
+                )
+                violations = "\n".join(audit.violations)
+                self.assertIn("incomplete mobile UI", violations)
+                self.assertIn(missing, violations)
+
+    def test_each_installable_needs_its_own_complete_ui(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            payload = _ui_payload("mobile")
+            (root / "complete.apk").write_bytes(
+                _zip_bytes({"assets/app.zip": _zip_bytes(payload)})
+            )
+            del payload["musicplayer/ui/mobile/shell.pyc"]
+            (root / "incomplete.apk").write_bytes(
+                _zip_bytes({"assets/app.zip": _zip_bytes(payload)})
+            )
+            audit = audit_artifacts([root], Path("pyproject.toml"), target="apk")
+        self.assertTrue(
+            any(
+                "incomplete.apk" in issue and "incomplete mobile UI" in issue
+                for issue in audit.violations
+            ),
+            audit.violations,
+        )
+
+    def test_ui_inventory_cannot_be_combined_across_app_archives(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            payload = _ui_payload("desktop")
+            shell = payload.pop("musicplayer/ui/desktop/shell.pyc")
+            (root / "app.zip").write_bytes(_zip_bytes(payload))
+            (root / "stray.zip").write_bytes(
+                _zip_bytes({"musicplayer/ui/desktop/shell.pyc": shell})
+            )
+            audit = audit_artifacts([root], Path("pyproject.toml"), target="windows")
+        self.assertIn("incomplete desktop UI", "\n".join(audit.violations))
 
     def test_artifact_audit_rejects_dev_packages_sources_and_test_data(self) -> None:
         release = json.dumps(EXPECTED_RELEASE_CONFIG).encode()

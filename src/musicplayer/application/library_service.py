@@ -53,8 +53,12 @@ class LibraryService:
         path = self.manager.track_path(track_id)
         self.manager.delete_track(track_id)
         self.store.remove_track_details(str(track_id))
-        if delete_file:
+        if delete_file and not self.manager.is_path_referenced(path):
             path.unlink(missing_ok=True)
+
+    def delete_track_and_file(self, track_id: UUID | str) -> None:
+        """Remove a library record and its owned media as one user action."""
+        self.delete_track(track_id, delete_file=True)
 
     def rename_track(self, track_id: UUID | str, title: str) -> None:
         self.manager.rename_track(track_id, title)

@@ -16,6 +16,10 @@ THEME_PALETTES: dict[str, str] = {
 }
 
 DEFAULT_PALETTE = "violet"
+TOUCH_TARGET = 48
+PAGE_TITLE_SIZE = 24
+CARD_RADIUS = 18
+FONT_FAMILY = "Segoe UI"
 
 # Legacy constant kept for call-sites that don't have access to settings.
 ACCENT = THEME_PALETTES[DEFAULT_PALETTE]
@@ -41,7 +45,7 @@ def build_theme(seed: str = ACCENT) -> ft.Theme:
         color_scheme_seed=seed,
         use_material3=True,
         visual_density=ft.VisualDensity.COMFORTABLE,
-        font_family="Segoe UI",
+        font_family=FONT_FAMILY,
     )
 
 
@@ -60,7 +64,7 @@ def card(
     return ft.Container(
         content=content,
         padding=padding,
-        border_radius=18,
+        border_radius=CARD_RADIUS,
         bgcolor=ft.Colors.SURFACE_CONTAINER,
         border=ft.Border.all(1, ft.Colors.OUTLINE_VARIANT),
         expand=expand,

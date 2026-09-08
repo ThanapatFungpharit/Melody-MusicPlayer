@@ -29,28 +29,7 @@ class SettingsPage(_Base):
     """Settings page UI and persistence workflow."""
 
     def _settings_view(self) -> ft.Control:
-        download = self._build_download_settings()
-        appearance = self._build_appearance_settings()
-        youtube_access = self._build_youtube_settings()
-        data_management = self._build_data_management_settings()
-        footer = self._build_settings_footer()
-        return ft.Column(
-            [
-                self._context_header(
-                    "Settings",
-                    "Tune playback, downloads, YouTube access, personalization, and appearance.",
-                ),
-                self._responsive_grid(
-                    [appearance, download, youtube_access, data_management],
-                    scroll=ft.ScrollMode.AUTO,
-                    expand=True,
-                ),
-                ft.Divider(height=1),
-                footer,
-            ],
-            spacing=16,
-            expand=True,
-        )
+        return self.views._settings_view(self)
 
     def _build_download_settings(self) -> ft.Container:
         self.settings_path = ft.TextField(
@@ -160,8 +139,14 @@ class SettingsPage(_Base):
         )
 
     def _build_appearance_settings(self) -> ft.Container:
+        # Keep in-progress appearance choices separate from persisted settings.
+        # The mobile settings screen may rebuild this section after a swatch or
+        # theme choice, so reading directly from ``settings`` would discard the
+        # user's current choice on every refresh.
+        self._theme_draft = getattr(self, "_theme_draft", self.settings.theme)
+        self._accent_draft = getattr(self, "_accent_draft", self.settings.accent_color)
         self.settings_theme = ft.Dropdown(
-            value=self.settings.theme,
+            value=self._theme_draft,
             label="Theme",
             height=56,
             border_radius=12,
@@ -170,6 +155,7 @@ class SettingsPage(_Base):
                 ft.DropdownOption(key="light", text="Light"),
                 ft.DropdownOption(key="system", text="Use system setting"),
             ],
+            on_select=self._theme_changed,
         )
         self.settings_resume = ft.Switch(
             label="Resume queue and playback state", value=self.settings.resume_session
@@ -178,7 +164,7 @@ class SettingsPage(_Base):
             label="Notify when tracks change", value=self.settings.notifications
         )
         # -- accent color picker ----------------------------------------
-        self._selected_accent = self.settings.accent_color
+        self._selected_accent = self._accent_draft
         self.accent_picker = self._build_accent_picker()
         return _settings_card(
             [
@@ -497,6 +483,7 @@ class SettingsPage(_Base):
 
         self.page.show_dialog(
             ft.AlertDialog(
+                scrollable=True,
                 modal=True,
                 icon=ft.Icon(
                     ft.Icons.WARNING_AMBER_ROUNDED,
@@ -610,11 +597,11 @@ class SettingsPage(_Base):
     def _refresh_after_data_action(self, action: str) -> None:
         if action in {"library", "playlists", "everything"}:
             self.selected_playlist_id = None
-            if hasattr(self, "content") and hasattr(self, "rail"):
+            if hasattr(self, "content"):
                 self.navigate(self.selected_navigation)
         if hasattr(self, "player_bar"):
             self._refresh_player()
-        if getattr(self, "active_panel", None) and getattr(self, "context_sheet", None):
+        if getattr(self, "active_panel", None):
             self._refresh_context_panel()
         else:
             self.page.update()
@@ -693,9 +680,18 @@ class SettingsPage(_Base):
 
     def _select_accent(self, name: str) -> None:
         """Update the visually selected accent palette."""
+        self._accent_draft = name
         self._selected_accent = name
         self.accent_picker = self._build_accent_picker()
+        self._reapply_accent()
         self._refresh_context_panel()
+
+    def _theme_changed(self, event: Any) -> None:
+        """Preview a theme choice immediately; persistence still happens on save."""
+        value = str(getattr(event.control, "value", "") or "system")
+        self._theme_draft = value
+        self.page.theme_mode = _theme_mode(value)
+        self.page.update()
 
     async def _pick_cookie_file(self, _: Any) -> None:
         try:
@@ -760,6 +756,10 @@ class SettingsPage(_Base):
         self._pending_cookie_file = None
         self._pending_cookie_name = ""
         self._remove_cookie_requested = False
+        self._theme_draft = self.settings.theme
+        self._accent_draft = self.settings.accent_color
+        self.page.theme_mode = _theme_mode(self.settings.theme)
+        self._reapply_accent()
         self._close_context_panel()
 
     def _save_settings(self) -> None:
@@ -816,8 +816,8 @@ class SettingsPage(_Base):
         self.settings.audio_format = self.settings_format.value or "mp3"
         self.settings.audio_quality = self.settings_quality.value or "best"
         self.settings.concurrent_downloads = int(self.settings_concurrency.value or 0)
-        self.settings.theme = self.settings_theme.value or "system"
-        self.settings.accent_color = self._selected_accent
+        self.settings.theme = self._theme_draft or self.settings_theme.value or "system"
+        self.settings.accent_color = self._accent_draft or self._selected_accent
         self.settings.cookie_file = cookie_file
         self.settings.resume_session = bool(self.settings_resume.value)
         self.settings.notifications = bool(self.settings_notifications.value)
@@ -825,6 +825,8 @@ class SettingsPage(_Base):
         self._pending_cookie_file = None
         self._pending_cookie_name = ""
         self._remove_cookie_requested = False
+        self._theme_draft = self.settings.theme
+        self._accent_draft = self.settings.accent_color
         self.providers = ProviderRegistry(settings=self.settings)
         self.page.theme_mode = _theme_mode(self.settings.theme)
         self._reapply_accent()

@@ -40,97 +40,12 @@ class SharedUIComponents(_Base):
             )
 
     def _playlist_card(self, playlist: Playlist) -> ft.Control:
-        track_count = len(playlist.track_ids)
-        artwork = (
-            self.library.details(playlist.track_ids[0]).thumbnail
-            if playlist.track_ids
-            else ""
-        )
-        compact = self.compact_layout
-        accent = self._accent_hex()
-        art_size = 120 if compact else 170
-        card_widget = ft.Container(
-            ft.Column(
-                [
-                    ft.Stack(
-                        [
-                            _artwork(artwork, art_size, playlist=True),
-                            ft.Container(
-                                ft.IconButton(
-                                    ft.Icons.PLAY_ARROW_ROUNDED,
-                                    bgcolor=accent,
-                                    icon_color=ft.Colors.WHITE,
-                                    icon_size=20 if compact else 24,
-                                    on_click=lambda _: self._play_playlist(playlist),
-                                ),
-                                right=8,
-                                bottom=8,
-                            ),
-                        ],
-                        width=art_size,
-                        height=art_size,
-                    ),
-                    ft.Text(
-                        playlist.name,
-                        size=15 if compact else 17,
-                        weight=ft.FontWeight.BOLD,
-                        max_lines=1,
-                    ),
-                    ft.Text(
-                        f"{track_count} track{'s' if track_count != 1 else ''}",
-                        color=ft.Colors.ON_SURFACE_VARIANT,
-                        size=12,
-                    ),
-                ],
-                spacing=7,
-            ),
-            padding=10 if compact else 12,
-            border_radius=18,
-            bgcolor=ft.Colors.SURFACE_CONTAINER,
-            border=ft.Border.all(1, ft.Colors.OUTLINE_VARIANT),
-            on_click=lambda _, item=str(playlist.id): self._open_playlist(item),
-        )
-        return card_widget
+        return self.views._playlist_card(self, playlist)
 
     def _context_header(
         self, title: str, subtitle: str, *actions: ft.Control
     ) -> ft.Control:
-        heading = ft.Column(
-            [
-                ft.Text(title, size=34, weight=ft.FontWeight.BOLD),
-                ft.Text(
-                    subtitle,
-                    size=14,
-                    color=ft.Colors.ON_SURFACE_VARIANT,
-                ),
-            ],
-            spacing=4,
-        )
-        heading.col = {"xs": 12, "sm": 8, "lg": 9}
-        header_actions = ft.Container(
-            ft.Row(
-                [
-                    *actions,
-                    ft.IconButton(
-                        ft.Icons.CLOSE_ROUNDED,
-                        tooltip="Close",
-                        icon_size=24,
-                        width=48,
-                        height=48,
-                        on_click=lambda _: self._close_context_panel(),
-                    ),
-                ],
-                spacing=12,
-                alignment=ft.MainAxisAlignment.END,
-                vertical_alignment=ft.CrossAxisAlignment.CENTER,
-            ),
-            alignment=ft.Alignment.CENTER_RIGHT,
-        )
-        header_actions.col = {"xs": 12, "sm": 4, "lg": 3}
-        return self._responsive_grid(
-            [heading, header_actions],
-            vertical_alignment=ft.CrossAxisAlignment.CENTER,
-        )
+        return self.shell.context_header(title, subtitle, *actions)
 
     @classmethod
     def _responsive_grid(

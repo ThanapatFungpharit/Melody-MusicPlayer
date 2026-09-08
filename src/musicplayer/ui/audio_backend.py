@@ -25,8 +25,9 @@ class FletAudioBackend:
 
     _OPERATION_TIMEOUT_SECONDS = 12
 
-    def __init__(self, page: ft.Page) -> None:
+    def __init__(self, page: ft.Page, *, use_device_volume: bool = False) -> None:
         self.page = page
+        self._use_device_volume = use_device_volume
         self.audio: fa.Audio | None = None
         self.on_position: Callable[[int], None] | None = None
         self.on_duration: Callable[[int], None] | None = None
@@ -241,7 +242,10 @@ class FletAudioBackend:
         self._pending_seek_position = None
 
     def set_volume(self, value: float) -> None:
-        self._volume = max(0.0, min(1.0, value))
+        gain = max(0.0, min(1.0, value))
+        # Phones use system media volume. Preserve the shared app-volume setting
+        # for desktop, but do not attenuate it behind an unavailable phone slider.
+        self._volume = float(gain > 0) if self._use_device_volume else gain
         if self.audio is None:
             return
         self.audio.volume = self._volume

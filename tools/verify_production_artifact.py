@@ -13,6 +13,14 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
+if __package__:
+    from tools.production_build import TARGET_PRESENTATIONS, required_ui_modules
+else:
+    from production_build import (  # ty: ignore[unresolved-import]
+        TARGET_PRESENTATIONS,
+        required_ui_modules,
+    )
+
 EXPECTED_RELEASE_CONFIG = {
     "schema": 1,
     "environment": "production",
@@ -218,6 +226,9 @@ def _path_violation(path: str, development_packages: set[str]) -> str | None:
 @dataclass
 class ArtifactAudit:
     development_packages: set[str]
+    expected_ui: str | None = None
+    required_ui: set[str] = field(default_factory=set)
+    packaged_modules: dict[str, set[str]] = field(default_factory=dict)
     violations: list[str] = field(default_factory=list)
     release_configs: list[tuple[str, dict[str, object]]] = field(default_factory=list)
     files_checked: int = 0
@@ -230,6 +241,14 @@ class ArtifactAudit:
             self.violations.append(f"{display_path}: {violation}")
 
         normalized = display_path.replace("\\", "/").casefold()
+        package_root, separator, module = normalized.rpartition("musicplayer/")
+        if separator and self.expected_ui:
+            self.packaged_modules.setdefault(package_root, set()).add(module)
+            opposite = "mobile" if self.expected_ui == "desktop" else "desktop"
+            if module.startswith(f"ui/{opposite}/"):
+                self.violations.append(
+                    f"{display_path}: unexpected {opposite} UI in a {self.expected_ui} artifact"
+                )
         if normalized.endswith("musicplayer/release.json"):
             if data is None:
                 self.violations.append(
@@ -339,13 +358,33 @@ class ArtifactAudit:
                     f"{path}: expected release settings "
                     f"{EXPECTED_RELEASE_CONFIG!r}, found {config!r}"
                 )
+            if self.expected_ui:
+                package_root = (
+                    path.replace("\\", "/").casefold().rpartition("musicplayer/")[0]
+                )
+                present = self.packaged_modules.get(package_root, set())
+                missing = self.required_ui - present
+                if missing:
+                    self.violations.append(
+                        f"{path}: incomplete {self.expected_ui} UI; missing compiled modules: "
+                        + ", ".join(sorted(missing))
+                    )
 
 
-def audit_artifacts(artifacts: Iterable[Path], project_file: Path) -> ArtifactAudit:
+def audit_artifacts(
+    artifacts: Iterable[Path], project_file: Path, *, target: str | None = None
+) -> ArtifactAudit:
     development_packages = (
         dependency_group_packages(project_file) | _KNOWN_DEVELOPMENT_PACKAGES
     )
-    audit = ArtifactAudit(development_packages=development_packages)
+    presentation = TARGET_PRESENTATIONS[target] if target else None
+    audit = ArtifactAudit(
+        development_packages=development_packages,
+        expected_ui=presentation,
+        required_ui=required_ui_modules(project_file, presentation)
+        if presentation
+        else set(),
+    )
     for artifact in artifacts:
         config_start = len(audit.release_configs)
         audit.inspect_artifact(artifact)
@@ -364,6 +403,11 @@ def main(argv: list[str] | None = None) -> int:
         help="Final artifact files or directories to inspect",
     )
     parser.add_argument(
+        "--target",
+        choices=tuple(TARGET_PRESENTATIONS),
+        help="Require this target's complete UI and reject the opposite presentation",
+    )
+    parser.add_argument(
         "--project-file",
         type=Path,
         default=Path(__file__).resolve().parents[1] / "pyproject.toml",
@@ -371,7 +415,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     arguments = parser.parse_args(argv)
 
-    audit = audit_artifacts(arguments.artifacts, arguments.project_file)
+    audit = audit_artifacts(
+        arguments.artifacts, arguments.project_file, target=arguments.target
+    )
     if audit.violations:
         print("Production artifact verification failed:", file=sys.stderr)
         for violation in audit.violations:
@@ -382,6 +428,7 @@ def main(argv: list[str] | None = None) -> int:
     print(
         "Production artifact verification passed: "
         f"{audit.files_checked} files in {audit.archives_checked} archives; "
+        f"UI: {audit.expected_ui or 'not checked (supply --target)'}; "
         f"excluded packages checked: {package_list}."
     )
     return 0

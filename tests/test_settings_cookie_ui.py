@@ -10,6 +10,7 @@ import flet as ft
 
 from musicplayer.app import MusicPlayerApp
 from musicplayer.application.models import AppSettings
+from musicplayer.ui.desktop.shell import DesktopShell
 
 COOKIE_FILE = b"""# Netscape HTTP Cookie File
 .youtube.com\tTRUE\t/\tTRUE\t2147483647\tSID\tsecret
@@ -63,6 +64,7 @@ class _FilePicker:
 class SettingsCookieUiTests(unittest.TestCase):
     def _app(self, directory: str, content: bytes) -> MusicPlayerApp:
         app = MusicPlayerApp.__new__(MusicPlayerApp)
+        app.shell = DesktopShell(app)
         app.page = _Page()  # ty: ignore[invalid-assignment]
         app.data_directory = Path(directory) / "app-data"
         app.settings = AppSettings(download_directory=directory)

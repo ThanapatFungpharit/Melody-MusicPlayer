@@ -35,6 +35,9 @@ class AppProtocol(Protocol):
 
     # -- core services ---------------------------------------------------
     page: ft.Page
+    views: Any
+    shell: Any
+    player: Any
     settings: AppSettings
     store: ApplicationStore
     manager: MusicManager
@@ -46,57 +49,23 @@ class AppProtocol(Protocol):
     file_picker: ft.FilePicker
     data_directory: Path
 
-    # -- layout state ----------------------------------------------------
-    compact_layout: bool
+    # Presentation-owned controls and shared navigation state.
     selected_navigation: int
     active_panel: str | None
-    context_sheet: ft.BottomSheet | None
     pending_download_actions: dict[str, tuple[str, str | None]]
-    COMPACT_BREAKPOINT: int
-
-    # -- navigation / shell controls -------------------------------------
     content: ft.Container
-    rail: ft.NavigationRail
-    rail_holder: ft.Container
-    mobile_header: ft.Container
-    mobile_drawer: ft.NavigationDrawer
-    bottom_nav: ft.NavigationBar
-    mobile_menu_button: ft.IconButton
-    download_button: ft.IconButton
-    system_safe_area: ft.SafeArea
     player_bar: ft.Container
-
-    # -- player bar controls ---------------------------------------------
-    player_art: ft.Container
-    player_title: ft.Text
-    player_credit: ft.Text
-    favorite_button: ft.IconButton
-    shuffle_button: ft.IconButton
-    play_button: ft.IconButton
-    repeat_button: ft.IconButton
-    position_label: ft.Text
-    duration_label: ft.Text
-    seek_slider: ft.Slider
-    volume_button: ft.IconButton
-    volume_slider: ft.Slider
-    volume_label: ft.Text
-    volume_down_button: ft.IconButton
-    volume_up_button: ft.IconButton
-    queue_button: ft.IconButton
-    player_info: ft.Row
-    skip_previous_button: ft.IconButton
-    skip_next_button: ft.IconButton
-    transport_row: ft.Row
-    seek_row: ft.Row
-    player_controls: ft.Column
-    player_volume: ft.Row
-    player_layout: ft.Row
-
-    # -- search page state -----------------------------------------------
     search_query: ft.TextField
-    search_provider: ft.Dropdown
-    search_results_area: ft.Column
-    search_loading: bool
+    search_button: ft.Button | ft.IconButton
+    batch_download_button: ft.Button
+    search_status: ft.Text
+    search_view_selector: ft.SegmentedButton
+    search_previous_button: ft.IconButton
+    search_first_button: ft.TextButton
+    search_next_button: ft.IconButton
+    search_page_label: ft.Text
+    search_pagination: ft.Row
+    search_list: ft.Column
 
     # -- library page state ----------------------------------------------
     library_mode: str
@@ -110,9 +79,6 @@ class AppProtocol(Protocol):
     playlist_import_loading: bool
     playlist_import_lock: Any
     playlist_import_retry: Any
-
-    # -- context panel state ---------------------------------------------
-    context_panel_body: ft.Container
 
     # -- settings page state ---------------------------------------------
     _selected_accent: str
@@ -139,14 +105,10 @@ class AppProtocol(Protocol):
     def _build_shell(self) -> None: ...
 
     # -- player methods --------------------------------------------------
-    def _build_player_bar(self) -> ft.Container: ...
-    def _apply_player_layout(self) -> None: ...
     def _refresh_player(self) -> None: ...
     def _refresh_player_progress(self) -> None: ...
     def _refresh_player_volume(self) -> None: ...
     def _sync_system_media(self, *, refresh_metadata: bool = ...) -> None: ...
-    def _set_player_progress(self) -> None: ...
-    def _set_player_volume(self) -> None: ...
 
     # -- context panel methods -------------------------------------------
     def _open_queue_panel(self) -> None: ...
@@ -191,10 +153,8 @@ class AppProtocol(Protocol):
     ) -> ft.ResponsiveRow: ...
 
     # -- layout helpers --------------------------------------------------
-    def _is_compact(self, width: float | None = ...) -> bool: ...
     def _accent_hex(self) -> str: ...
     def _reapply_accent(self) -> None: ...
-    def _content_padding(self, width: float | None = ...) -> ft.Padding: ...
     def _is_mobile_platform(self) -> bool: ...
 
     # -- messaging / background ------------------------------------------
@@ -207,6 +167,7 @@ class AppProtocol(Protocol):
     def _toggle_current_favorite(self, event: Any) -> None: ...
     def _track_details_dialog(self, track: Any) -> None: ...
     def _add_to_playlist(self, playlist_id: str, track_id: str) -> None: ...
+    def _available_search_track(self, result: Any) -> Any: ...
     def _refresh_library_list(self, *, update: bool = ...) -> None: ...
 
     # -- playlist page helpers -------------------------------------------
@@ -226,4 +187,3 @@ class AppProtocol(Protocol):
     def _download_changed(self, record: Any) -> None: ...
 
     # -- close drawer helpers --------------------------------------------
-    async def _close_mobile_drawer(self) -> None: ...

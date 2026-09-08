@@ -62,7 +62,6 @@ class DataManagementUiTests(unittest.TestCase):
         self.app.playback = _Playback()  # ty: ignore[invalid-assignment]
         self.app.selected_playlist_id = None
         self.app.active_panel = None
-        self.app.context_sheet = None
         self.app._show_message = Mock()
         self.app._show_error = Mock()
 

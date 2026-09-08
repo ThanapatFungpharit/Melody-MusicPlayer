@@ -19,14 +19,9 @@ from musicplayer.core.concurrency import WorkerQueueFull
 from musicplayer.core.library.models import Playlist, Track
 from musicplayer.core.library.utils import source_key
 from musicplayer.ui.components.common import (
-    _artwork,
-    _empty_state,
-    _format_duration,
-    _page_header,
     _track_credit,
     _track_title,
 )
-from musicplayer.ui.theme import card
 
 if TYPE_CHECKING:
     from musicplayer.ui._app_protocol import AppProtocol
@@ -66,196 +61,14 @@ class PlaylistsPage(_PlaylistBase):
         self.playlist_import_retry: Timer | None = None
 
     def _playlists_view(self) -> ft.Control:
-        if self.selected_playlist_id and self.manager.has_playlist(
-            self.selected_playlist_id
-        ):
-            return self._playlist_detail(
-                self.manager.get_playlist(self.selected_playlist_id)
-            )
-        self.selected_playlist_id = None
-        playlists = self.manager.list_playlists()
-        if playlists:
-            body: ft.Control = ft.Row(
-                [self._playlist_card(playlist) for playlist in playlists],
-                wrap=True,
-                spacing=14,
-                run_spacing=14,
-                scroll=ft.ScrollMode.AUTO,
-                expand=True,
-            )
-        else:
-            body = ft.Container(
-                _empty_state(
-                    ft.Icons.QUEUE_MUSIC_ROUNDED,
-                    "Create a playlist or import one from YouTube to get started.",
-                ),
-                alignment=ft.Alignment.CENTER,
-                expand=True,
-            )
-        playlists_header = _page_header(
-            "Playlists",
-            "Persistent collections, separate from your temporary queue.",
-        )
-        playlists_header.col = {"xs": 12, "md": 7}
-        playlist_actions = ft.Container(
-            ft.Row(
-                [
-                    ft.OutlinedButton(
-                        "Import playlist",
-                        icon=ft.Icons.PLAYLIST_ADD_ROUNDED,
-                        on_click=lambda _: self._import_playlist_dialog(),
-                    ),
-                    ft.Button(
-                        "New playlist",
-                        icon=ft.Icons.ADD_ROUNDED,
-                        on_click=lambda _: self._create_playlist_dialog(),
-                    ),
-                ],
-                spacing=8,
-                scroll=ft.ScrollMode.AUTO,
-                alignment=ft.MainAxisAlignment.END,
-            ),
-            alignment=ft.Alignment.CENTER_RIGHT,
-            col={"xs": 12, "md": 5},
-        )
-        return ft.Column(
-            [
-                self._responsive_grid(
-                    [playlists_header, playlist_actions],
-                    spacing=10,
-                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                ),
-                body,
-            ],
-            spacing=20,
-            expand=True,
-        )
+        return self.views._playlists_view(self)
 
     def _open_playlist(self, playlist_id: str) -> None:
         self.selected_playlist_id = playlist_id
         self.navigate(3)
 
     def _playlist_detail(self, playlist: Playlist) -> ft.Control:
-        tracks = self.manager.playlist_tracks(playlist.id)
-        track_ids = tuple(str(track.id) for track in tracks)
-        other_playlists = tuple(
-            item for item in self.manager.list_playlists() if item.id != playlist.id
-        )
-        compact = self.compact_layout
-        bulk_add_button: ft.Control
-        if compact:
-            bulk_add_button = ft.IconButton(
-                ft.Icons.PLAYLIST_ADD_ROUNDED,
-                tooltip="Add to playlist",
-                on_click=lambda _: self._bulk_add_tracks_dialog(playlist),
-            )
-            play_button: ft.Control = ft.IconButton(
-                ft.Icons.PLAY_ARROW_ROUNDED,
-                tooltip="Play playlist",
-                on_click=lambda _: self._play_playlist(playlist),
-            )
-        else:
-            bulk_add_button = ft.OutlinedButton(
-                "Add to playlist",
-                icon=ft.Icons.PLAYLIST_ADD_ROUNDED,
-                on_click=lambda _: self._bulk_add_tracks_dialog(playlist),
-            )
-            play_button = ft.Button(
-                "Play",
-                icon=ft.Icons.PLAY_ARROW_ROUNDED,
-                on_click=lambda _: self._play_playlist(playlist),
-            )
-        rows: ft.Control
-        if tracks:
-            rows = ft.ReorderableListView(
-                controls=[
-                    self._playlist_track_row(
-                        playlist,
-                        track,
-                        index,
-                        other_playlists,
-                        track_ids,
-                    )
-                    for index, track in enumerate(tracks)
-                ],
-                spacing=6,
-                show_default_drag_handles=True,
-                mouse_cursor=ft.MouseCursor.GRAB,
-                on_reorder=lambda event, pid=str(playlist.id): self._reorder_playlist(
-                    pid, event.old_index, event.new_index
-                ),
-                expand=True,
-            )
-        else:
-            rows = _empty_state(
-                ft.Icons.PLAYLIST_ADD_ROUNDED,
-                "This playlist is empty. Add tracks from Search or Library.",
-                expand=True,
-            )
-        return ft.Column(
-            [
-                ft.Row(
-                    [
-                        ft.IconButton(
-                            ft.Icons.ARROW_BACK_ROUNDED,
-                            tooltip="All playlists",
-                            on_click=lambda _: self._close_playlist(),
-                        ),
-                        ft.Column(
-                            [
-                                ft.Text(
-                                    playlist.name, size=30, weight=ft.FontWeight.BOLD
-                                ),
-                                ft.Text(
-                                    f"{len(tracks)} track{'s' if len(tracks) != 1 else ''}",
-                                    color=ft.Colors.ON_SURFACE_VARIANT,
-                                ),
-                            ],
-                            spacing=2,
-                            expand=True,
-                        ),
-                        bulk_add_button,
-                        play_button,
-                        ft.IconButton(
-                            ft.Icons.SHUFFLE_ROUNDED,
-                            tooltip="Shuffle playlist",
-                            on_click=lambda _: self._play_playlist(
-                                playlist, shuffle=True
-                            ),
-                        ),
-                        ft.IconButton(
-                            ft.Icons.ADD_TO_QUEUE_ROUNDED,
-                            tooltip="Add playlist to queue",
-                            on_click=lambda _: self._queue_collection(tracks),
-                        ),
-                        ft.PopupMenuButton(
-                            icon=ft.Icons.MORE_HORIZ_ROUNDED,
-                            items=[
-                                ft.PopupMenuItem(
-                                    content="Rename playlist",
-                                    icon=ft.Icons.EDIT_ROUNDED,
-                                    on_click=lambda _: self._rename_playlist_dialog(
-                                        playlist
-                                    ),
-                                ),
-                                ft.PopupMenuItem(
-                                    content="Delete playlist",
-                                    icon=ft.Icons.DELETE_OUTLINE_ROUNDED,
-                                    on_click=lambda _: self._delete_playlist_dialog(
-                                        playlist
-                                    ),
-                                ),
-                            ],
-                        ),
-                    ],
-                    scroll=ft.ScrollMode.AUTO,
-                ),
-                ft.Divider(height=1),
-                rows,
-            ],
-            spacing=16,
-            expand=True,
-        )
+        return self.views._playlist_detail(self, playlist)
 
     def _playlist_track_row(
         self,
@@ -265,125 +78,8 @@ class PlaylistsPage(_PlaylistBase):
         other_playlists: tuple[Playlist, ...],
         playlist_track_ids: tuple[str, ...],
     ) -> ft.Control:
-        details = self.library.details(track.id)
-        menu: list[ft.PopupMenuItem] = [
-            ft.PopupMenuItem(
-                content="Play next",
-                icon=ft.Icons.QUEUE_PLAY_NEXT_ROUNDED,
-                on_click=lambda _, tid=str(track.id): self.playback.add_next(tid),
-            ),
-            ft.PopupMenuItem(
-                content="Add to queue",
-                icon=ft.Icons.ADD_TO_QUEUE_ROUNDED,
-                on_click=lambda _, tid=str(track.id): self.playback.add_last(tid),
-            ),
-            ft.PopupMenuItem(
-                content="Favorite" if not details.favorite else "Remove favorite",
-                icon=ft.Icons.FAVORITE_BORDER_ROUNDED,
-                on_click=lambda _, tid=str(track.id): self._toggle_favorite(tid),
-            ),
-            ft.PopupMenuItem(
-                content="View details",
-                icon=ft.Icons.INFO_OUTLINE_ROUNDED,
-                on_click=lambda _, item=track: self._track_details_dialog(item),
-            ),
-        ]
-        for target in other_playlists:
-            menu.extend(
-                [
-                    ft.PopupMenuItem(
-                        content=f"Copy to {target.name}",
-                        icon=ft.Icons.CONTENT_COPY_ROUNDED,
-                        on_click=lambda _, source=str(playlist.id), destination=str(target.id), tid=str(track.id): (
-                            self._transfer_playlist_track(
-                                source, destination, tid, move=False
-                            )
-                        ),
-                    ),
-                    ft.PopupMenuItem(
-                        content=f"Move to {target.name}",
-                        icon=ft.Icons.DRIVE_FILE_MOVE_OUTLINE,
-                        on_click=lambda _, source=str(playlist.id), destination=str(target.id), tid=str(track.id): (
-                            self._transfer_playlist_track(
-                                source, destination, tid, move=True
-                            )
-                        ),
-                    ),
-                ]
-            )
-        menu.append(
-            ft.PopupMenuItem(
-                content="Remove from playlist",
-                icon=ft.Icons.REMOVE_CIRCLE_OUTLINE_ROUNDED,
-                on_click=lambda _, pid=str(playlist.id), tid=str(track.id): (
-                    self._remove_from_playlist(pid, tid)
-                ),
-            )
-        )
-        compact = self.compact_layout
-        leading: list[ft.Control] = []
-        if not compact:
-            leading.extend(
-                [
-                    ft.Icon(
-                        ft.Icons.DRAG_INDICATOR_ROUNDED,
-                        color=ft.Colors.ON_SURFACE_VARIANT,
-                    ),
-                    ft.Text(
-                        str(index + 1),
-                        width=28,
-                        text_align=ft.TextAlign.CENTER,
-                        color=ft.Colors.ON_SURFACE_VARIANT,
-                    ),
-                ]
-            )
-        trailing: list[ft.Control] = []
-        if not compact:
-            trailing.append(
-                ft.Text(
-                    _format_duration(details.duration),
-                    size=12,
-                    color=ft.Colors.ON_SURFACE_VARIANT,
-                )
-            )
-        trailing.extend(
-            [
-                ft.IconButton(
-                    ft.Icons.PLAY_ARROW_ROUNDED,
-                    tooltip="Play from here",
-                    on_click=lambda _, ids=playlist_track_ids, start=index: (
-                        self.playback.play_tracks(ids, start_index=start)
-                    ),
-                ),
-                ft.PopupMenuButton(icon=ft.Icons.MORE_HORIZ_ROUNDED, items=menu),
-            ]
-        )
-        return card(
-            ft.Row(
-                [
-                    *leading,
-                    _artwork(details.thumbnail, 48),
-                    ft.Column(
-                        [
-                            ft.Text(
-                                _track_title(track),
-                                weight=ft.FontWeight.W_600,
-                                max_lines=1,
-                            ),
-                            ft.Text(
-                                _track_credit(details),
-                                size=12,
-                                color=ft.Colors.ON_SURFACE_VARIANT,
-                            ),
-                        ],
-                        spacing=3,
-                        expand=True,
-                    ),
-                    *trailing,
-                ]
-            ),
-            padding=10,
-            key=f"{playlist.id}:{index}:{track.id}",
+        return self.views._playlist_track_row(
+            self, playlist, track, index, other_playlists, playlist_track_ids
         )
 
     def _close_playlist(self) -> None:
@@ -411,6 +107,7 @@ class PlaylistsPage(_PlaylistBase):
 
         self.page.show_dialog(
             ft.AlertDialog(
+                scrollable=True,
                 modal=True,
                 title=ft.Text("New playlist"),
                 content=field,
@@ -430,7 +127,7 @@ class PlaylistsPage(_PlaylistBase):
             label="YouTube playlist URL",
             hint_text="https://www.youtube.com/playlist?list=…",
             autofocus=True,
-            width=None if self.compact_layout else 560,
+            width=min(560, max(160, float(self.page.width or 360) - 80)),
         )
 
         def begin(_: Any) -> None:
@@ -456,6 +153,7 @@ class PlaylistsPage(_PlaylistBase):
         )
         self.page.show_dialog(
             ft.AlertDialog(
+                scrollable=True,
                 modal=True,
                 title=ft.Text("Import playlist"),
                 content=ft.Column(
@@ -506,7 +204,12 @@ class PlaylistsPage(_PlaylistBase):
             pending: deque[tuple[str, SearchResult]] = deque()
             reused = 0
             for key, result in unique:
-                existing = self.manager.find_track_by_source(result.url)
+                resolver = getattr(self.downloads, "available_track", None)
+                existing = (
+                    resolver(result.url)
+                    if resolver is not None
+                    else self.manager.find_track_by_source(result.url)
+                )
                 if existing is None:
                     pending.append((key, result))
                     continue
@@ -606,7 +309,31 @@ class PlaylistsPage(_PlaylistBase):
                 session.waiting_key = key
                 session.waiting_owned = True
                 try:
-                    task = self.downloads.start(result)
+                    requester = getattr(self.downloads, "request", None)
+                    task = (
+                        requester(result)
+                        if requester is not None
+                        else self.downloads.start(result)
+                    )
+                    if task is None:
+                        resolver = getattr(self.downloads, "available_track", None)
+                        existing = (
+                            resolver(result.url)
+                            if resolver is not None
+                            else self.manager.find_track_by_source(result.url)
+                        )
+                        if existing is None:
+                            raise RuntimeError(
+                                "The downloaded track is not available yet."
+                            )
+                        session.resolved[key] = str(existing.id)
+                        session.pending.popleft()
+                        session.reused += 1
+                        session.waiting_key = None
+                        session.waiting_owned = False
+                        session.waiting_task_id = None
+                        self._sync_imported_playlist(session)
+                        continue
                     session.waiting_task_id = str(task.id)
                 except WorkerQueueFull:
                     session.waiting_key = None
@@ -712,6 +439,7 @@ class PlaylistsPage(_PlaylistBase):
 
         self.page.show_dialog(
             ft.AlertDialog(
+                scrollable=True,
                 modal=True,
                 title=ft.Text("Rename playlist"),
                 content=field,
@@ -732,6 +460,7 @@ class PlaylistsPage(_PlaylistBase):
 
         self.page.show_dialog(
             ft.AlertDialog(
+                scrollable=True,
                 modal=True,
                 title=ft.Text("Delete playlist?"),
                 content=ft.Text(
@@ -824,7 +553,7 @@ class PlaylistsPage(_PlaylistBase):
             track_list = ft.Column(
                 cast(list[ft.Control], checkboxes),
                 spacing=2,
-                height=340,
+                height=min(340, max(96, float(self.page.height or 640) * 0.35)),
                 scroll=ft.ScrollMode.AUTO,
             )
         else:
@@ -842,6 +571,7 @@ class PlaylistsPage(_PlaylistBase):
 
         self.page.show_dialog(
             ft.AlertDialog(
+                scrollable=True,
                 modal=True,
                 title=ft.Text(f"Add tracks to “{playlist.name}”"),
                 content=ft.Column(
@@ -856,7 +586,7 @@ class PlaylistsPage(_PlaylistBase):
                     ],
                     spacing=10,
                     tight=True,
-                    width=None if self.compact_layout else 560,
+                    width=min(560, max(160, float(self.page.width or 360) - 80)),
                 ),
                 actions=[
                     ft.TextButton("Cancel", on_click=lambda _: self.page.pop_dialog()),
@@ -891,3 +621,68 @@ class PlaylistsPage(_PlaylistBase):
         else:
             self.manager.copy_playlist_track(source, target, track_id)
         self.navigate(3)
+
+    def _playlist_track_menu(
+        self,
+        playlist: Playlist,
+        track: Track,
+        index: int,
+        other_playlists: tuple[Playlist, ...],
+        playlist_track_ids: tuple[str, ...],
+    ) -> list[ft.PopupMenuItem]:
+        details = self.library.details(track.id)
+        menu: list[ft.PopupMenuItem] = [
+            ft.PopupMenuItem(
+                content="Play next",
+                icon=ft.Icons.QUEUE_PLAY_NEXT_ROUNDED,
+                on_click=lambda _, tid=str(track.id): self.playback.add_next(tid),
+            ),
+            ft.PopupMenuItem(
+                content="Add to queue",
+                icon=ft.Icons.ADD_TO_QUEUE_ROUNDED,
+                on_click=lambda _, tid=str(track.id): self.playback.add_last(tid),
+            ),
+            ft.PopupMenuItem(
+                content="Favorite" if not details.favorite else "Remove favorite",
+                icon=ft.Icons.FAVORITE_BORDER_ROUNDED,
+                on_click=lambda _, tid=str(track.id): self._toggle_favorite(tid),
+            ),
+            ft.PopupMenuItem(
+                content="View details",
+                icon=ft.Icons.INFO_OUTLINE_ROUNDED,
+                on_click=lambda _, item=track: self._track_details_dialog(item),
+            ),
+        ]
+        for target in other_playlists:
+            menu.extend(
+                [
+                    ft.PopupMenuItem(
+                        content=f"Copy to {target.name}",
+                        icon=ft.Icons.CONTENT_COPY_ROUNDED,
+                        on_click=lambda _, source=str(playlist.id), destination=str(target.id), tid=str(track.id): (
+                            self._transfer_playlist_track(
+                                source, destination, tid, move=False
+                            )
+                        ),
+                    ),
+                    ft.PopupMenuItem(
+                        content=f"Move to {target.name}",
+                        icon=ft.Icons.DRIVE_FILE_MOVE_OUTLINE,
+                        on_click=lambda _, source=str(playlist.id), destination=str(target.id), tid=str(track.id): (
+                            self._transfer_playlist_track(
+                                source, destination, tid, move=True
+                            )
+                        ),
+                    ),
+                ]
+            )
+        menu.append(
+            ft.PopupMenuItem(
+                content="Remove from playlist",
+                icon=ft.Icons.REMOVE_CIRCLE_OUTLINE_ROUNDED,
+                on_click=lambda _, pid=str(playlist.id), tid=str(track.id): (
+                    self._remove_from_playlist(pid, tid)
+                ),
+            )
+        )
+        return menu

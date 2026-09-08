@@ -10,6 +10,7 @@ import flet as ft
 from musicplayer.app import MusicPlayerApp
 from musicplayer.application.models import AppSettings, DownloadRecord, SearchResult
 from musicplayer.core.library.models import Playlist
+from musicplayer.ui.desktop.shell import DesktopShell
 
 
 class _Page:
@@ -69,21 +70,11 @@ class _Store:
 class AppLayoutTests(unittest.TestCase):
     def _app(self) -> MusicPlayerApp:
         app = MusicPlayerApp.__new__(MusicPlayerApp)
+        app.shell = DesktopShell(app)
         app.page = _Page()  # ty: ignore[invalid-assignment]
         app.settings = AppSettings()
         app.providers = _Providers()  # ty: ignore[invalid-assignment]
-        app.compact_layout = False
         return app
-
-    def test_context_panel_dimensions_respond_to_window_size(self) -> None:
-        app = self._app()
-
-        self.assertEqual(app._context_panel_height(960), 900)
-        self.assertEqual(app._context_panel_height(700), 658)
-        self.assertEqual(app._context_panel_width(1540), 1540)
-        self.assertEqual(app._context_panel_width(1040), 1040)
-        self.assertEqual(app._context_panel_padding(1540).left, 40)
-        self.assertEqual(app._context_panel_padding(800).left, 20)
 
     def test_progress_media_sync_reuses_resolved_track_metadata(self) -> None:
         app = self._app()
@@ -121,22 +112,6 @@ class AppLayoutTests(unittest.TestCase):
             2000,
         )
 
-    def test_shell_reserves_bottom_system_safe_area(self) -> None:
-        app = self._app()
-        content = ft.Container()
-
-        safe_area = app._system_safe_area(content)
-
-        self.assertIsInstance(safe_area, ft.SafeArea)
-        self.assertIs(safe_area.content, content)
-        self.assertTrue(safe_area.expand)
-        self.assertTrue(safe_area.avoid_intrusions_bottom)
-        self.assertFalse(safe_area.avoid_intrusions_left)
-        self.assertFalse(safe_area.avoid_intrusions_top)
-        self.assertFalse(safe_area.avoid_intrusions_right)
-        self.assertTrue(safe_area.maintain_bottom_view_padding)
-        self.assertEqual(safe_area.minimum_padding.bottom, 16)  # ty: ignore[unresolved-attribute]
-
     def test_settings_uses_responsive_sections_and_fixed_footer(self) -> None:
         app = self._app()
 
@@ -145,8 +120,7 @@ class AppLayoutTests(unittest.TestCase):
         sections = view.controls[1]  # ty: ignore[unresolved-attribute]
         footer = view.controls[-1]  # ty: ignore[unresolved-attribute]
 
-        self.assertIsInstance(header, ft.ResponsiveRow)
-        self.assertEqual(header.columns, 12)
+        self.assertIsInstance(header, ft.Row)
         self.assertIsInstance(sections, ft.ResponsiveRow)
         self.assertEqual(sections.columns, 12)
         self.assertEqual(len(sections.controls), 4)

@@ -17,6 +17,9 @@ from musicplayer.core.library.utils import source_key
 
 
 class _Page:
+    width = 1540
+    height = 960
+
     def __init__(self) -> None:
         self.dialogs: list[ft.Control] = []
         self.pop_count = 0
@@ -74,7 +77,6 @@ class PlaylistFeatureTests(unittest.TestCase):
         self.app.library = _Library()  # ty: ignore[invalid-assignment]
         self.app.downloads = _Downloads()  # ty: ignore[invalid-assignment]
         self.app.selected_navigation = 3
-        self.app.compact_layout = False
         self.app.navigate = Mock()
         self.app._show_message = Mock()
         self.app._show_error = Mock()

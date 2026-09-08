@@ -12,13 +12,13 @@ from musicplayer.platform_runtime import current_architecture
 if __package__:
     from tools.fetch_media_binaries import fetch_bundle
     from tools.production_build import (
-        hardened_flet_arguments,
+        platform_flet_arguments,
         production_build_environment,
     )
 else:
     from fetch_media_binaries import fetch_bundle  # ty: ignore[unresolved-import]
     from production_build import (  # ty: ignore[unresolved-import]
-        hardened_flet_arguments,
+        platform_flet_arguments,
         production_build_environment,
     )
 
@@ -40,7 +40,9 @@ def main() -> None:
     extra = flet_arguments
     if extra[:1] == ["--"]:
         extra = extra[1:]
-    extra = hardened_flet_arguments(extra)
+    extra = platform_flet_arguments(
+        extra, target=arguments.target, project_file=PROJECT_ROOT / "pyproject.toml"
+    )
     build_environment = production_build_environment()
 
     for architecture in architectures:

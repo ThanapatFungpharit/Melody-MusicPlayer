@@ -3,11 +3,19 @@
 from __future__ import annotations
 
 import os
+import tomllib
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 
 RELEASE_PYTHON_VERSION = "3.13"
+TARGET_PRESENTATIONS = {
+    "windows": "desktop",
+    "linux": "desktop",
+    "macos": "desktop",
+    "apk": "mobile",
+    "aab": "mobile",
+}
 
 _FALSE_VALUES = {"", "0", "false", "no", "off"}
 _DEBUG_ENVIRONMENT_VARIABLES = (
@@ -153,6 +161,51 @@ def hardened_flet_arguments(arguments: Sequence[str]) -> list[str]:
             f"production build: {', '.join(forbidden)}"
         )
     return [*arguments, *_REQUIRED_FLET_ARGUMENTS]
+
+
+def platform_flet_arguments(
+    arguments: Sequence[str], *, target: str, project_file: Path
+) -> list[str]:
+    """Keep shared exclusions while packaging only the target's presentation.
+
+    Flet's CLI exclusion list replaces the TOML list. Repeated --exclude options
+    extend the CLI list, so user exclusions and our required exclusions coexist.
+    Both separators are needed by the native packager on Windows and POSIX.
+    """
+    presentation = TARGET_PRESENTATIONS[target]
+    opposite = "mobile" if presentation == "desktop" else "desktop"
+    with project_file.open("rb") as stream:
+        config = tomllib.load(stream)["tool"]["flet"]
+    config_platform = "android" if target in {"apk", "aab"} else target
+    exclusions = [
+        *config.get("app", {}).get("exclude", []),
+        *config.get(config_platform, {}).get("app", {}).get("exclude", []),
+        f"musicplayer/ui/{opposite}",
+        f"musicplayer\\ui\\{opposite}",
+    ]
+    return [
+        *hardened_flet_arguments(arguments),
+        "--exclude",
+        *dict.fromkeys(exclusions),
+    ]
+
+
+def required_ui_modules(project_file: Path, presentation: str) -> set[str]:
+    """Expected compiled UI inventory, including every shared UI module."""
+    if presentation not in {"mobile", "desktop"}:
+        raise ValueError(f"Unknown presentation: {presentation}")
+    with project_file.open("rb") as stream:
+        config = tomllib.load(stream)["tool"]["flet"]
+    package = project_file.parent / config["app"]["path"] / "musicplayer"
+    opposite = "mobile" if presentation == "desktop" else "desktop"
+    modules = {
+        path.relative_to(package).with_suffix(".pyc").as_posix()
+        for path in (package / "ui").rglob("*.py")
+        if opposite not in path.relative_to(package / "ui").parts
+    }
+    if f"ui/{presentation}/shell.pyc" not in modules:
+        raise ValueError(f"Missing {presentation} UI sources under {package / 'ui'}")
+    return modules
 
 
 @contextmanager

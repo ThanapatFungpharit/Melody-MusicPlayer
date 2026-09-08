@@ -11,7 +11,7 @@ from typing import Any
 
 from tools.fetch_media_binaries import fetch_bundle
 from tools.production_build import (
-    hardened_flet_arguments,
+    platform_flet_arguments,
     production_process_environment,
     validate_android_release_signing,
 )
@@ -51,16 +51,19 @@ def stage_android_native_libraries(
 def _run_flet_build(
     target: str, architectures: list[str], flet_arguments: list[str]
 ) -> None:
+    # ``flet-cli`` is present in the isolated release/build environment. Keep
+    # these imports local so the application runtime and UI smoke tests do not
+    # need the packaging tool installed.
     from flet_cli import cli
     from flet_cli.commands.build import Command
 
     original_run_flutter = Command.run_flutter
 
-    def run_flutter(command: Any) -> None:
-        stage_android_native_libraries(command.flutter_dir, architectures)
-        original_run_flutter(command)
+    def run_flutter(self: Any) -> None:
+        stage_android_native_libraries(self.flutter_dir, architectures)
+        original_run_flutter(self)
 
-    Command.run_flutter = run_flutter  # ty: ignore[invalid-assignment]
+    Command.run_flutter = run_flutter
     previous_argv = sys.argv
     try:
         sys.argv = [
@@ -92,7 +95,11 @@ def main() -> None:
     architectures = arguments.architectures or ["arm64", "arm", "x86_64"]
     if flet_arguments[:1] == ["--"]:
         flet_arguments = flet_arguments[1:]
-    flet_arguments = hardened_flet_arguments(flet_arguments)
+    flet_arguments = platform_flet_arguments(
+        flet_arguments,
+        target=arguments.target,
+        project_file=PROJECT_ROOT / "pyproject.toml",
+    )
 
     validate_android_release_signing(os.environ)
     with production_process_environment():

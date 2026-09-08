@@ -130,6 +130,42 @@ class DownloadCoordinator:
         with self._lock:
             return self._active_record_for_source_locked(url) is not None
 
+    def available_track(self, url: str) -> Track | None:
+        """Return the canonical intact library track for *url*, if one exists."""
+        if not url:
+            return None
+        existing = self.manager.find_track_by_source(url)
+        if existing is None:
+            return None
+        try:
+            return (
+                existing
+                if self.manager.check_track_integrity(existing.id) is None
+                else None
+            )
+        except (OSError, KeyError, ValueError):
+            return None
+
+    def request(self, result: SearchResult) -> DownloadTask | None:
+        """Reuse an existing track or active job before scheduling new work.
+
+        ``None`` means the requested media is already available in the library.
+        An existing active task is returned so callers can attach a follow-up
+        action without creating another download or staging another media file.
+        """
+        if not result.url:
+            raise ValueError("This result does not provide a downloadable URL.")
+        metadata = {
+            "url": result.url,
+            "title": result.title,
+            "uploader": result.uploader,
+            "thumbnail": result.thumbnail,
+            "source": result.source,
+            "kind": result.kind,
+            "duration": result.duration,
+        }
+        return self._request(metadata)
+
     def start(self, result: SearchResult) -> DownloadTask:
         if not result.url:
             raise ValueError("This result does not provide a downloadable URL.")
@@ -177,16 +213,30 @@ class DownloadCoordinator:
         batch_id = str(uuid4())
         batch_created_at = time.time()
         tasks: list[DownloadTask] = []
-        for position, source in enumerate(sources, start=1):
+        seen_keys: set[str] = set()
+        unique_sources: list[str] = []
+        for source in sources:
+            key = source_key(source)
+            if key and key in seen_keys:
+                continue
+            if key:
+                seen_keys.add(key)
+            unique_sources.append(source)
+
+        for position, source in enumerate(unique_sources, start=1):
             metadata: dict[str, object] = {
-                **_url_metadata(source, title=f"Song {position} of {len(sources)}"),
+                **_url_metadata(
+                    source, title=f"Song {position} of {len(unique_sources)}"
+                ),
                 "batch_id": batch_id,
                 "batch_position": position,
-                "batch_size": len(sources),
+                "batch_size": len(unique_sources),
                 "created_at": batch_created_at,
             }
             try:
-                tasks.append(self._start(metadata))
+                task = self._request(metadata)
+                if task is not None:
+                    tasks.append(task)
             except Exception as error:
                 # A scheduling error is recorded for this song, then the rest of
                 # the batch is still submitted.
@@ -194,7 +244,21 @@ class DownloadCoordinator:
                     "Batch download could not be scheduled: url=%s", source
                 )
                 self._record_start_failure(metadata, error)
-        return DownloadBatch(batch_id, tuple(tasks), len(sources))
+        return DownloadBatch(batch_id, tuple(tasks), len(unique_sources))
+
+    def _request(self, metadata: dict[str, object]) -> DownloadTask | None:
+        url = str(metadata.get("url") or "")
+        if not url:
+            raise ValueError("A YouTube URL is required.")
+        if not is_youtube_url(url):
+            raise ValueError("Only YouTube URLs are supported.")
+        if metadata.get("kind") != "playlist" and self.available_track(url):
+            return None
+        with self._lock:
+            active = self._active_record_for_source_locked(url)
+            if active is not None:
+                return DownloadTask(_uuid(active.id))
+        return self._start(metadata)
 
     def _start(self, metadata: dict[str, object]) -> DownloadTask:
         url = str(metadata["url"])
@@ -212,9 +276,15 @@ class DownloadCoordinator:
         with self._lock:
             if self._active_record_for_source_locked(url):
                 raise DuplicateDownloadError("This track is already downloading.")
-            return self._downloader.start(
+            task = self._downloader.start(
                 url, on_progress=progress_callback, on_complete=complete_callback
             )
+            # Some downloader implementations publish their first progress
+            # callback asynchronously. Register the source before returning so
+            # a second request in that gap still joins this task.
+            self._ensure_record_locked(task, metadata)
+            self._persist()
+            return task
 
     def cancel(self, record_id: str) -> bool:
         return self._downloader.cancel(DownloadTask(_uuid(record_id)))
@@ -369,14 +439,25 @@ class DownloadCoordinator:
 
     def _reuse_library_track(self, track: Track, path: Path, source: str) -> Path:
         """Keep intact audio, or repair its file without replacing the track record."""
+        previous_path = self.manager.track_path(track.id)
         problem = self.manager.check_track_integrity(track.id)
         if problem is None:
-            stored_path = self.manager.track_path(track.id)
+            stored_path = previous_path
             if path.resolve() != stored_path.resolve():
                 path.unlink()
         else:
             self.manager.replace_track_file(track.id, path)
             stored_path = self.manager.track_path(track.id)
+            if previous_path.resolve() != stored_path.resolve():
+                try:
+                    if not self.manager.is_path_referenced(previous_path):
+                        previous_path.unlink(missing_ok=True)
+                except OSError:
+                    logger.warning(
+                        "Could not remove the superseded library file: path=%s",
+                        previous_path,
+                        exc_info=True,
+                    )
         if not track.source:
             self.manager.update_track(track.id, source=source)
         logger.info(
@@ -391,16 +472,22 @@ class DownloadCoordinator:
     def _record(
         self, task: DownloadTask, metadata: dict[str, object]
     ) -> DownloadRecord:
+        return self._ensure_record_locked(task, metadata)
+
+    def _ensure_record_locked(
+        self, task: DownloadTask, metadata: dict[str, object]
+    ) -> DownloadRecord:
+        """Create the durable operation record while the source is reserved."""
         key = str(task.id)
         record = self._records.get(key)
         if record is None:
             record = _record_from_metadata(key, metadata)
             self._records[key] = record
-            identity = source_key(record.url)
-            if identity:
-                self._active_records_by_source[identity] = record.id
             self._ordered_records = None
             self._prune_records_locked()
+        identity = source_key(record.url)
+        if identity and record.status in self.ACTIVE_STATUSES:
+            self._active_records_by_source[identity] = record.id
         return record
 
     def _record_start_failure(

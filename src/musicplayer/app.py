@@ -49,7 +49,8 @@ from musicplayer.ui.pages import (
     SearchPage,
     SettingsPage,
 )
-from musicplayer.ui.theme import accent_color
+from musicplayer.ui.presentation import PresentationKind, presentation_kind
+from musicplayer.ui.theme import accent_color, build_theme
 
 logger = logging.getLogger(__name__)
 
@@ -84,7 +85,20 @@ class MusicPlayerApp(
 ):
     """Application composition root for Melody's page and component modules."""
 
-    COMPACT_BREAKPOINT = 760
+    @property
+    def views(self):
+        # Release bundles contain only the presentation for their native target.
+        # Keep the other package out of the import graph, including at startup.
+        if (
+            getattr(self, "presentation", PresentationKind.DESKTOP)
+            is PresentationKind.MOBILE
+        ):
+            from musicplayer.ui import mobile
+
+            return mobile
+        from musicplayer.ui import desktop
+
+        return desktop
 
     def __init__(self, page: ft.Page) -> None:
         self.page = page
@@ -107,7 +121,9 @@ class MusicPlayerApp(
         self._system_media_metadata = ("", "", "", "")
         self.file_picker = ft.FilePicker()
         page.services.append(self.file_picker)
-        self.backend = FletAudioBackend(page)
+        self.backend = FletAudioBackend(
+            page, use_device_volume=self._is_mobile_platform()
+        )
         self.playback = PlaybackController(
             self.manager,
             self.library,
@@ -136,10 +152,19 @@ class MusicPlayerApp(
         self._initialize_library_page()
         self._initialize_playlists_page()
         self.active_panel: str | None = None
-        self.context_sheet: ft.BottomSheet | None = None
         self.pending_download_actions: dict[str, tuple[str, str | None]] = {}
         self._last_announced_track: str | None = None
-        self.compact_layout = self._is_compact()
+        self.presentation = presentation_kind(
+            page.platform, native_mobile=self._is_mobile_platform()
+        )
+        if self.presentation is PresentationKind.MOBILE:
+            from musicplayer.ui.mobile.shell import MobileShell
+
+            self.shell = MobileShell(self)
+        else:
+            from musicplayer.ui.desktop.shell import DesktopShell
+
+            self.shell = DesktopShell(self)
         self._configure_page()
         self._build_shell()
 
@@ -147,25 +172,7 @@ class MusicPlayerApp(
         self.page.title = "Melody — Music player"
         self.page.padding = 0
         self.page.spacing = 0
-        seed = self._accent_hex()
-        self.page.theme = ft.Theme(
-            color_scheme_seed=seed,
-            use_material3=True,
-            visual_density=ft.VisualDensity.COMFORTABLE,
-            font_family="Segoe UI",
-            bottom_sheet_theme=ft.BottomSheetTheme(
-                size_constraints=ft.BoxConstraints(max_width=10000),
-            ),
-        )
-        self.page.dark_theme = ft.Theme(
-            color_scheme_seed=seed,
-            use_material3=True,
-            visual_density=ft.VisualDensity.COMFORTABLE,
-            font_family="Segoe UI",
-            bottom_sheet_theme=ft.BottomSheetTheme(
-                size_constraints=ft.BoxConstraints(max_width=10000),
-            ),
-        )
+        self._reapply_accent()
         self.page.theme_mode = _theme_mode(self.settings.theme)
         # Window constraints are meaningful on desktop only. Applying the
         # desktop minimum size to an Android/iOS window makes the app render
@@ -201,7 +208,7 @@ class MusicPlayerApp(
             and current != self._last_announced_track
         ):
             self._last_announced_track = current
-            self._show_message(f"Now playing: {self.player_title.value}")
+            self._show_message(f"Now playing: {self.player.title.value}")
         if self.active_panel == "queue":
             self._refresh_context_panel()
 
@@ -314,68 +321,20 @@ class MusicPlayerApp(
 
     def _keyboard_event(self, event: ft.KeyboardEvent) -> None:
         key = event.key.casefold()
-        if event.ctrl and key == "l":
-            self.navigate(1)
-            try:
-                self.page.run_task(self.search_query.focus)
-            except Exception:
-                logger.debug("Could not focus the search field", exc_info=True)
-        elif event.ctrl and key == "q":
-            self._open_queue_panel()
-        elif event.ctrl and key == "d":
-            self._open_downloads_panel()
-        elif event.ctrl and key == ",":
-            self._open_settings_panel()
-        elif (event.ctrl and key == " ") or key in {
-            "media play pause",
-            "mediaplaypause",
-        }:
+        if key in {"media play pause", "mediaplaypause"}:
             self.playback.toggle()
         elif key in {"media track next", "medianexttrack"}:
             self.playback.next()
         elif key in {"media track previous", "mediaprevioustrack"}:
             self.playback.previous()
+        else:
+            self.shell.keyboard(event)
 
     async def _page_resized(self, event: Any) -> None:
-        width = float(getattr(event, "width", 0) or self.page.width or 1540)
-        height = float(getattr(event, "height", 0) or self.page.height or 960)
-        compact = self._is_compact(width)
-        extended = width >= 1180
-        changed: list[ft.Control] = []
-        if self.compact_layout != compact:
-            self.compact_layout = compact
-            self.rail_holder.visible = not compact
-            self.mobile_header.visible = compact
-            self.bottom_nav.visible = compact
-            self.content.padding = self._content_padding(width)
-            self._apply_player_layout()
-            changed.extend(
-                [
-                    self.rail_holder,
-                    self.mobile_header,
-                    self.bottom_nav,
-                    self.content,
-                    self.player_bar,
-                ]
-            )
-            if not compact:
-                await self._close_mobile_drawer()
-        if self.rail.extended != extended:
-            self.rail.extended = extended
-            changed.append(self.rail)
-        if self.context_sheet and hasattr(self, "context_panel_body"):
-            panel_width = self._context_panel_width(width)
-            self.context_panel_body.width = panel_width
-            self.context_panel_body.height = self._context_panel_height(height)
-            self.context_panel_body.padding = self._context_panel_padding(width)
-            self.context_sheet.size_constraints = ft.BoxConstraints(
-                min_width=panel_width,
-                max_width=panel_width,
-            )
-            changed.append(self.context_panel_body)
-            changed.append(self.context_sheet)
-        if changed:
-            self.page.update(*changed)
+        self.shell.resize(
+            float(getattr(event, "width", 0) or self.page.width or 1540),
+            float(getattr(event, "height", 0) or self.page.height or 960),
+        )
 
     def _is_mobile_platform(self) -> bool:
         platform = str(getattr(self.page, "platform", "")).casefold()
@@ -386,52 +345,13 @@ class MusicPlayerApp(
         except UnsupportedPlatformError:
             return False
 
-    def _is_compact(self, width: float | None = None) -> bool:
-        if self._is_mobile_platform():
-            return True
-        available = width
-        if available is None:
-            available = float(
-                getattr(self.page, "width", 0)
-                or getattr(getattr(self.page, "window", None), "width", 0)
-                or 0
-            )
-        return bool(available and available < self.COMPACT_BREAKPOINT)
-
     def _accent_hex(self) -> str:
         """Resolve the current accent-color hex from settings."""
-        return accent_color(self.settings.accent_color)
+        return accent_color(getattr(self, "_accent_draft", self.settings.accent_color))
 
     def _reapply_accent(self) -> None:
-        """Rebuild themes after the user changes the accent palette."""
-        seed = self._accent_hex()
-        self.page.theme = ft.Theme(
-            color_scheme_seed=seed,
-            use_material3=True,
-            visual_density=ft.VisualDensity.COMFORTABLE,
-            font_family="Segoe UI",
-            bottom_sheet_theme=ft.BottomSheetTheme(
-                size_constraints=ft.BoxConstraints(max_width=10000),
-            ),
-        )
-        self.page.dark_theme = ft.Theme(
-            color_scheme_seed=seed,
-            use_material3=True,
-            visual_density=ft.VisualDensity.COMFORTABLE,
-            font_family="Segoe UI",
-            bottom_sheet_theme=ft.BottomSheetTheme(
-                size_constraints=ft.BoxConstraints(max_width=10000),
-            ),
-        )
-
-    def _content_padding(self, width: float | None = None) -> ft.Padding:
-        compact = self._is_compact(width)
-        return ft.Padding.only(
-            left=16 if compact else 34,
-            top=16 if compact else 28,
-            right=16 if compact else 34,
-            bottom=16 if compact else 20,
-        )
+        self.page.theme = build_theme(self._accent_hex())
+        self.page.dark_theme = build_theme(self._accent_hex())
 
     def _close(self, _: Any) -> None:
         self._cancel_playlist_import_retry()
