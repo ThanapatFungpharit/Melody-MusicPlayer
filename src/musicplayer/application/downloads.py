@@ -5,7 +5,7 @@ import re
 import threading
 import time
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -16,6 +16,7 @@ from musicplayer.core.downloader import (
     DownloadStatus,
     DownloadTask,
 )
+from musicplayer.core.downloader.receipts import read_receipt, receipt_path
 from musicplayer.core.library import MusicManager
 from musicplayer.core.library.models import Track
 from musicplayer.core.library.utils import source_key
@@ -86,8 +87,24 @@ class DownloadCoordinator:
         self._records = {record.id: record for record in store.downloads()}
         self._ordered_records: tuple[DownloadRecord, ...] | None = None
         self._active_records_by_source: dict[str, str] = {}
+        self._recover_handoffs()
         recovered = False
         for record in self._records.values():
+            if (
+                record.status == "completed"
+                and record.track_ids
+                and any(
+                    not self.manager.has_track(track_id)
+                    or not self.manager.track_path(track_id).is_file()
+                    for track_id in record.track_ids
+                )
+            ):
+                recovered = True
+                record.status = "failed"
+                record.error = (
+                    "The downloaded library file is missing. Retry to restore it."
+                )
+                record.error_kind, record.recovery = "disk", "retry"
             if record.status in self.ACTIVE_STATUSES:
                 recovered = True
                 record.status = "failed"
@@ -96,6 +113,7 @@ class DownloadCoordinator:
                 )
         if recovered:
             self._persist()
+        self._publish_read_state()
         self._downloader = Downloader(
             settings.download_directory,
             max_workers=settings.concurrent_downloads,
@@ -103,32 +121,38 @@ class DownloadCoordinator:
             options=_download_options(settings),
         )
 
-    def list(self) -> tuple[DownloadRecord, ...]:
-        with self._lock:
-            if self._ordered_records is None:
-                self._ordered_records = tuple(
-                    sorted(
-                        self._records.values(),
-                        key=lambda item: (item.created_at, -item.batch_position),
-                        reverse=True,
-                    )
+    def _publish_read_state(self) -> None:
+        records = {
+            key: replace(record, track_ids=list(record.track_ids))
+            for key, record in self._records.items()
+        }
+        self._read_state = (
+            records,
+            tuple(
+                sorted(
+                    records.values(),
+                    key=lambda item: (item.created_at, -item.batch_position),
+                    reverse=True,
                 )
-            return self._ordered_records
+            ),
+            dict(self._active_records_by_source),
+        )
+
+    def list(self) -> tuple[DownloadRecord, ...]:
+        return tuple(
+            replace(record, track_ids=list(record.track_ids))
+            for record in self._read_state[1]
+        )
 
     def get(self, record_id: str) -> DownloadRecord | None:
-        """Return a history record by identifier without sorting all records."""
-        with self._lock:
-            return self._records.get(str(record_id))
+        record = self._read_state[0].get(str(record_id))
+        return replace(record, track_ids=list(record.track_ids)) if record else None
 
     def active_count(self) -> int:
-        """Return the number of downloads still owned by the core service."""
-        with self._lock:
-            return len(self._active_records_by_source)
+        return len(self._read_state[2])
 
     def is_source_active(self, url: str) -> bool:
-        """Return whether an equivalent source is already being downloaded."""
-        with self._lock:
-            return self._active_record_for_source_locked(url) is not None
+        return source_key(url) in self._read_state[2]
 
     def available_track(self, url: str) -> Track | None:
         """Return the canonical intact library track for *url*, if one exists."""
@@ -258,7 +282,7 @@ class DownloadCoordinator:
             active = self._active_record_for_source_locked(url)
             if active is not None:
                 return DownloadTask(_uuid(active.id))
-        return self._start(metadata)
+            return self._start(metadata)
 
     def _start(self, metadata: dict[str, object]) -> DownloadTask:
         url = str(metadata["url"])
@@ -316,8 +340,8 @@ class DownloadCoordinator:
             self._ordered_records = None
             self._persist()
 
-    def shutdown(self) -> None:
-        self._downloader.shutdown(wait=False, cancel_pending=True)
+    def shutdown(self, *, wait: bool = False) -> None:
+        self._downloader.shutdown(wait=wait, cancel_pending=True)
 
     def _handle_progress(
         self, progress: DownloadProgress, metadata: dict[str, object]
@@ -354,6 +378,7 @@ class DownloadCoordinator:
                 self._last_progress_persist = now
             if should_notify:
                 self._last_progress_notify = now
+                self._publish_read_state()
         if should_notify:
             self._notify(record)
 
@@ -365,7 +390,11 @@ class DownloadCoordinator:
             uploader = record.uploader
             thumbnail = record.thumbnail
         final_status = result.status.value
-        final_error = _friendly_download_error(result.error)
+        final_error = (
+            result.failure.message
+            if result.failure
+            else _friendly_download_error(result.error)
+        )
         imported: list[str] | None = None
         stored_filename: str | None = None
         completed_at: float | None = None
@@ -393,6 +422,8 @@ class DownloadCoordinator:
         with self._lock:
             record.status = final_status
             record.error = final_error
+            record.error_kind = result.failure.kind.value if result.failure else ""
+            record.recovery = result.failure.recovery if result.failure else ""
             if imported is not None:
                 assert completed_at is not None
                 record.progress = 1.0
@@ -405,7 +436,51 @@ class DownloadCoordinator:
                 self._active_records_by_source.pop(identity, None)
             self._prune_records_locked()
             self._persist()
+        if record.status == "completed":
+            try:
+                receipt_path(
+                    Path(self.settings.download_directory), result.task.id
+                ).unlink(missing_ok=True)
+            except OSError:
+                logger.warning(
+                    "Could not acknowledge completed download receipt", exc_info=True
+                )
         self._notify(record)
+
+    def _recover_handoffs(self) -> None:
+        """Finish a download whose bytes survived but registration was interrupted."""
+        for path in Path(self.settings.download_directory).glob(
+            ".melody-download-*.json"
+        ):
+            try:
+                task_id, url, files = read_receipt(path)
+                record = self._records.get(str(task_id))
+                metadata = _url_metadata(
+                    url, title=record.title if record else files[0].stem
+                )
+                track_ids = []
+                for file in files:
+                    track_id, _ = self._import_downloaded_file(
+                        file,
+                        metadata,
+                        uploader=record.uploader if record else "",
+                        thumbnail=record.thumbnail if record else "",
+                    )
+                    track_ids.append(str(track_id))
+                record = self._ensure_record_locked(DownloadTask(task_id), metadata)
+                record.status, record.progress, record.error = "completed", 1.0, ""
+                record.error_kind, record.recovery = "", ""
+                record.track_ids, record.completed_at = track_ids, time.time()
+                record.filename = self.manager.track_path(track_ids[0]).name
+                self._active_records_by_source.pop(source_key(url), None)
+                self._persist()
+                path.unlink()
+            except (OSError, ValueError, KeyError, TypeError):
+                # Keep ambiguous files and the receipt for repair; never adopt
+                # unrelated files merely because they share the music folder.
+                logger.warning(
+                    "Could not reconcile download receipt %s", path.name, exc_info=True
+                )
 
     def _import_downloaded_file(
         self,
@@ -416,26 +491,30 @@ class DownloadCoordinator:
         thumbnail: str,
     ) -> tuple[UUID, Path]:
         """Register audio or reuse its library identity, preserving existing metadata."""
-        source = str(metadata["url"])
-        existing = self.manager.find_track_by_source(
-            source
-        ) or self.manager.find_track_by_content(path)
-        if existing is not None:
-            return existing.id, self._reuse_library_track(existing, path, source)
+        with self.manager.mutation():
+            source = str(metadata["url"])
+            details = TrackDetails(
+                uploader=uploader,
+                duration=float(str(metadata.get("duration") or 0)),
+                thumbnail=thumbnail,
+                source_name=str(metadata.get("source") or "YouTube"),
+            )
+            existing = self.manager.find_track_by_source(
+                source
+            ) or self.manager.find_track_by_content(path)
+            if existing is not None:
+                if not self.store.has_track_details(str(existing.id)):
+                    self.store.save_track_details(str(existing.id), details)
+                stored_path = self._reuse_library_track(existing, path, source)
+                return existing.id, stored_path
 
-        track_id = self.manager.add_track(
-            path,
-            source=source,
-            title=str(metadata.get("title") or path.stem),
-        )
-        details = TrackDetails(
-            uploader=uploader,
-            duration=float(str(metadata.get("duration") or 0)),
-            thumbnail=thumbnail,
-            source_name=str(metadata.get("source") or "YouTube"),
-        )
-        self.store.save_track_details(str(track_id), details)
-        return track_id, self.manager.track_path(track_id)
+            track_id = self.manager.add_track(
+                path,
+                source=source,
+                title=str(metadata.get("title") or path.stem),
+            )
+            self.store.save_track_details(str(track_id), details)
+            return track_id, self.manager.track_path(track_id)
 
     def _reuse_library_track(self, track: Track, path: Path, source: str) -> Path:
         """Keep intact audio, or repair its file without replacing the track record."""
@@ -506,6 +585,7 @@ class DownloadCoordinator:
 
     def _persist(self) -> None:
         self.store.save_downloads(self._records.values())
+        self._publish_read_state()
 
     def _prune_records_locked(self) -> None:
         """Retain bounded history while never evicting an active operation."""
@@ -527,7 +607,7 @@ class DownloadCoordinator:
     def _notify(self, record: DownloadRecord) -> None:
         if self.on_change:
             try:
-                self.on_change(record)
+                self.on_change(replace(record, track_ids=list(record.track_ids)))
             except Exception:
                 # A disconnected window must never fail the download worker.
                 logger.debug("Download listener failed", exc_info=True)

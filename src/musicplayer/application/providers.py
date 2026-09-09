@@ -6,8 +6,6 @@ from itertools import islice
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
-from yt_dlp import CookieLoadError, YoutubeDL
-
 from musicplayer.platform_runtime import yt_dlp_binary_options
 from musicplayer.runtime_environment import public_error_message
 
@@ -15,6 +13,29 @@ from .models import AppSettings, SearchResult
 from .yt_dlp_settings import yt_dlp_options
 
 logger = logging.getLogger(__name__)
+
+
+def __getattr__(name: str) -> Any:
+    """Keep the old patchable module attributes without an eager import."""
+    if name not in {"CookieLoadError", "YoutubeDL"}:
+        raise AttributeError(name)
+    symbols = _yt_dlp_symbols()
+    return symbols[name]
+
+
+def _yt_dlp_symbols() -> dict[str, Any]:
+    youtube_dl = globals().get("YoutubeDL")
+    cookie_load_error = globals().get("CookieLoadError")
+    if youtube_dl is None or cookie_load_error is None:
+        from yt_dlp import CookieLoadError as loaded_cookie_error
+        from yt_dlp import YoutubeDL as loaded_youtube_dl
+
+        youtube_dl = loaded_youtube_dl
+        cookie_load_error = loaded_cookie_error
+        globals()["YoutubeDL"] = youtube_dl
+        globals()["CookieLoadError"] = cookie_load_error
+    return {"CookieLoadError": cookie_load_error, "YoutubeDL": youtube_dl}
+
 
 YOUTUBE_PROVIDER_ID = "youtube"
 _YOUTUBE_HOSTS = {
@@ -277,13 +298,7 @@ def _friendly_provider_error(error: Exception) -> str:
 
 
 def _extract_info(target: str, options: dict[str, Any]) -> dict[str, Any] | None:
-    try:
-        with YoutubeDL(options) as downloader:
-            return downloader.extract_info(target, download=False)
-    except CookieLoadError:
-        if "cookiefile" not in options:
-            raise
-        logger.warning("Cookie file could not be loaded; retrying yt-dlp anonymously")
-        fallback = {key: value for key, value in options.items() if key != "cookiefile"}
-        with YoutubeDL(fallback) as downloader:
-            return downloader.extract_info(target, download=False)
+    symbols = _yt_dlp_symbols()
+    youtube_dl = symbols["YoutubeDL"]
+    with youtube_dl(options) as downloader:
+        return downloader.extract_info(target, download=False)

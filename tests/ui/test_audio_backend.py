@@ -104,6 +104,75 @@ class FletAudioBackendTests(unittest.TestCase):
         self.assertEqual(first_payload["position_ms"], 1_000)
         self.assertEqual(second_payload["position_ms"], 5_000)
 
+    def test_failed_media_session_update_can_be_retried(self) -> None:
+        class FailingSession:
+            async def sync(self, **_: object) -> None:
+                raise ValueError("native session is not ready")
+
+            async def deactivate(self) -> None:
+                pass
+
+        page = FakePage()
+        backend = FletAudioBackend(page)  # type: ignore[arg-type]  # ty: ignore[invalid-argument-type]
+        backend.media_session = FailingSession()  # ty: ignore[invalid-assignment]
+
+        backend.sync_media_session(title="Track", playing=True)
+        generation, payload, snapshot = page.scheduled[0][1]
+        asyncio.run(backend._run_media_sync(generation, payload, snapshot))
+
+        self.assertIsNone(backend._media_snapshot)
+        self.assertIsNone(backend._media_pending_snapshot)
+
+        # The same state must be schedulable again after a transient native
+        # failure; otherwise the lock screen can remain stale indefinitely.
+        backend.sync_media_session(title="Track", playing=True)
+        self.assertEqual(len(page.scheduled), 2)
+
+    def test_media_session_snapshot_commits_only_after_success(self) -> None:
+        class WorkingSession:
+            async def sync(self, **_: object) -> None:
+                pass
+
+            async def deactivate(self) -> None:
+                pass
+
+        page = FakePage()
+        backend = FletAudioBackend(page)  # type: ignore[arg-type]  # ty: ignore[invalid-argument-type]
+        backend.media_session = WorkingSession()  # ty: ignore[invalid-assignment]
+
+        backend.sync_media_session(title="Track", playing=False)
+        generation, payload, snapshot = page.scheduled[0][1]
+        asyncio.run(backend._run_media_sync(generation, payload, snapshot))
+
+        backend.sync_media_session(title="Track", playing=False)
+        self.assertEqual(len(page.scheduled), 1)
+
+    def test_refresh_state_publishes_native_position_and_duration(self) -> None:
+        class NativeAudio:
+            async def get_current_position(self) -> SimpleNamespace:
+                return SimpleNamespace(in_milliseconds=12_345)
+
+            async def get_duration(self) -> SimpleNamespace:
+                return SimpleNamespace(in_milliseconds=180_000)
+
+        page = FakePage()
+        backend = FletAudioBackend(page)  # type: ignore[arg-type]  # ty: ignore[invalid-argument-type]
+        backend.audio = NativeAudio()  # ty: ignore[invalid-assignment]
+        backend._loaded = True
+        positions: list[int] = []
+        durations: list[int] = []
+        backend.bind(
+            on_position=positions.append,
+            on_duration=durations.append,
+            on_playing=lambda _: None,
+            on_completed=lambda: None,
+        )
+
+        asyncio.run(backend._refresh_state(backend._generation))
+
+        self.assertEqual(positions, [12_345])
+        self.assertEqual(durations, [180_000])
+
     def test_native_media_action_is_forwarded_to_controller_callback(self) -> None:
         page = FakePage()
         backend = FletAudioBackend(page)  # type: ignore[arg-type]  # ty: ignore[invalid-argument-type]

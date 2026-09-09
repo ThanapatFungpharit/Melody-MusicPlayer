@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-import shutil
+import os
 import stat
 import tempfile
 from collections import deque
@@ -15,13 +15,13 @@ from threading import Event, Lock
 from typing import Any
 from uuid import UUID, uuid4
 
-from yt_dlp import CookieLoadError, YoutubeDL
-
 from musicplayer.core.concurrency import LazyBoundedExecutor
-from musicplayer.platform_runtime import yt_dlp_binary_options
+from musicplayer.core.storage import sync_directory
 
 from .config import OPTS
+from .errors import classify_download_error
 from .models import DownloadProgress, DownloadResult, DownloadStatus, DownloadTask
+from .receipts import file_digest, receipt_path, write_receipt
 
 logger = logging.getLogger(__name__)
 ProgressCallback = Callable[[DownloadProgress], None]
@@ -72,7 +72,7 @@ class Downloader:
         # Keep the proven defaults in ``core.downloader.config`` while allowing
         # the application layer to apply user-selected codec and quality
         # settings without duplicating the downloader implementation.
-        self._options = {**OPTS, **yt_dlp_binary_options(), **(options or {})}
+        self._options = {**OPTS, **(options or {})}
         if max_retained_jobs < 1:
             raise ValueError("max_retained_jobs must be at least 1")
         pending_limit = max_workers if max_pending is None else max_pending
@@ -160,12 +160,14 @@ class Downloader:
         except Exception as error:
             logger.exception("Download failed: url=%s", job.progress.url)
             self._remove_files(files)
-            self._finish(job, DownloadStatus.FAILED, error=str(error))
+            self._finish(job, DownloadStatus.FAILED, error=str(error), exception=error)
         else:
             self._finish(job, DownloadStatus.COMPLETED, files=files)
 
     def _download_one(self, job: _Job) -> tuple[Path, ...]:
-        with tempfile.TemporaryDirectory() as temporary_directory:
+        with tempfile.TemporaryDirectory(
+            dir=self._output_dir, prefix=".melody-download-"
+        ) as temporary_directory:
             temporary_path = Path(temporary_directory)
             self._run_yt_dlp(job, temporary_directory)
             self._raise_if_cancelled(job)
@@ -175,28 +177,24 @@ class Downloader:
         return tuple(files)
 
     def _run_yt_dlp(self, job: _Job, temporary_directory: str) -> None:
+        # Imported only after the startup updater has selected and activated a
+        # wheel.  Keeping this out of module import time protects all entry
+        # points, including source-tree launches and test discovery.
+        from yt_dlp import YoutubeDL
+
         options: dict[str, Any] = {
             **self._options,
             "paths": {"home": temporary_directory},
             "progress_hooks": [self._progress_hook(job)],
         }
-        try:
-            with YoutubeDL(options) as downloader:
-                downloader.download([job.progress.url])
-        except CookieLoadError:
-            if "cookiefile" not in options:
-                raise
-            logger.warning("Cookie file could not be loaded; retrying anonymously")
-            fallback = {
-                key: value for key, value in options.items() if key != "cookiefile"
-            }
-            with YoutubeDL(fallback) as downloader:
-                downloader.download([job.progress.url])
+        with YoutubeDL(options) as downloader:
+            downloader.download([job.progress.url])
 
     def _move_downloaded_files(
         self, job: _Job, temporary_directory: Path
     ) -> list[Path]:
         files: list[Path] = []
+        entries: list[dict[str, str]] = []
         try:
             for source in temporary_directory.iterdir():
                 self._raise_if_cancelled(job)
@@ -211,7 +209,16 @@ class Downloader:
                     )
                 destination = self._reserve_destination(source.name)
                 try:
-                    shutil.move(str(source), str(destination))
+                    entries.append(
+                        {"filename": destination.name, "sha256": file_digest(source)}
+                    )
+                    write_receipt(
+                        self._output_dir, job.task.id, job.progress.url, entries
+                    )
+                    with source.open("rb+") as stream:
+                        os.fsync(stream.fileno())
+                    os.replace(source, destination)
+                    sync_directory(destination.parent)
                 finally:
                     # Once moved, destination.exists() provides collision
                     # protection. Failed moves must not leak reservations.
@@ -282,10 +289,19 @@ class Downloader:
         *,
         files: tuple[Path, ...] = (),
         error: str = "",
+        exception: Exception | None = None,
     ) -> None:
         with self._lock:
             if job.result is not None:
                 return
+            # Cancellation and successful completion have one linearization
+            # point. A request accepted first owns cleanup and terminal status.
+            if job.cancelled.is_set():
+                status = DownloadStatus.CANCELLED
+                self._remove_files(files)
+                files, error = (), ""
+            if status is not DownloadStatus.COMPLETED:
+                self._remove_files((receipt_path(self._output_dir, job.task.id),))
             job.progress = DownloadProgress(
                 task=job.progress.task,
                 url=job.progress.url,
@@ -302,7 +318,14 @@ class Downloader:
                 thumbnail=job.progress.thumbnail,
             )
             job.result = DownloadResult(
-                job.task, job.progress.url, status, files, error
+                job.task,
+                job.progress.url,
+                status,
+                files,
+                error,
+                classify_download_error(exception or error)
+                if status is DownloadStatus.FAILED
+                else None,
             )
             self._terminal_jobs.append(job.task.id)
             self._prune_terminal_jobs_locked()

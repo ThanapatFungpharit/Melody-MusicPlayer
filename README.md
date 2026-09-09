@@ -22,6 +22,8 @@ Melody is a cross-platform music player and downloader built with Python 3.12+, 
 
 ## Architecture
 
+The state owners, dependency rules, crash-recovery contracts, and native lifecycle limits are documented in [Architecture and invariants](docs/architecture.md). See [Contributing](CONTRIBUTING.md) for the test groups and [Release and dependency policy](docs/releases-and-dependencies.md) for versioning, the local background-audio bridge, and runtime yt-dlp selection.
+
 The original `core/` remains authoritative:
 
 - `core.concurrency.LazyBoundedExecutor` provides lazy, bounded worker pools with immediate overload backpressure and automatic idle retirement.
@@ -64,6 +66,7 @@ The latency-sensitive paths are deliberately bounded:
 - Local audio files are read on the bounded I/O pool. Generation checks discard stale results when the user changes tracks before a read finishes, preventing both UI blocking and activation of obsolete audio bytes.
 - Playback position and duration events update only the seek slider and time labels instead of rebuilding the complete player bar, re-reading track metadata, and recreating artwork on every tick.
 - System media state is updated immediately for track, transport, queue-mode, and artwork changes, while position-only updates are throttled to once every five seconds. The operating system extrapolates the playhead between updates, preserving an accurate seek surface without waking the Python UI on every audio tick.
+- Returning from the background reconciles the UI with the native player's current position and duration before the media-session timeline is corrected, so the in-app seek surface does not jump back to its last foreground value.
 - Android holds the audio player's wake lock only while playback requires it; Melody deliberately leaves the media session's optional Wi-Fi and background keepalive locks disabled. iOS uses the native playback audio-session category, and the underlying player handles transient audio-focus interruptions such as calls before resuming when the operating system restores focus.
 - Desktop volume changes reach the audio backend continuously while dragging, but the durable setting is written only when the drag settles. Mobile delegates loudness to the device's media volume controls and exposes a shared mute/restore capability; button and mute changes remain immediately durable.
 - Starting a track commits play count, last-played time, recents, history, and the current session queue in one atomic state-file replacement. Private application state uses compact JSON to reduce serialization and disk traffic.
@@ -103,6 +106,13 @@ without broad storage permissions. The location can be changed in Settings.
 
 YouTube access is anonymous by default. To use a signed-in session, export a UTF-8 Netscape-format `cookies.txt` file and upload it in Settings. Melody validates the file and copies it to the platform's private application-data directory. It never detects browsers or reads their cookie databases, so the same workflow is available on desktop and Android. Cookie files contain sensitive session credentials and should not be shared.
 
+Melody always ships with an immutable bundled `yt-dlp` fallback. At startup it
+validates the updater state and its trusted pure-Python `py3-none-any` wheels,
+then can activate a newer verified release from the writable application-data
+directory. Downloads are SHA-256 checked and installed with atomic file
+operations; network, cache, and recovery failures leave startup on the bundled
+version. At most the current and previous verified runtime wheels are retained.
+
 ## Test and lint
 
 Preview either presentation with an isolated sample library and silent playback:
@@ -115,13 +125,15 @@ uv run python tools/preview_ui.py --mobile
 
 Use `--empty` to check a new library. The preview uses temporary data and never opens your saved music or settings.
 
-The test suite also stages and compiles each presentation with the other UI
-removed, then builds every page and panel from the compiled package using the
-isolated fixture. The release workflow runs these tests with Python 3.13, plus
-lint, formatting, and type checks, before starting native builds.
+Tests are separated into `tests/unit`, `tests/integration`, `tests/ui`, and
+`tests/packaging`. Normal validation runs on every pull request and main-branch
+change. Packaging tests separately stage and compile each presentation with the
+other UI removed, then build every page and panel using an isolated fixture.
+The release workflow reuses validation before starting native builds.
 
 ```console
-uv run python -m unittest discover -s tests -v
+uv run --locked python -m unittest discover -s tests/unit -t . -v
+uv run --locked --group build python -m unittest discover -s tests -t . -v
 uv run ruff check src tests
 uv run ruff format --check src tests
 ```
@@ -136,10 +148,10 @@ extracts only `ffmpeg` and `ffprobe`, and then packages them with the app:
 
 ```console
 uv sync --no-dev --group build
-uv run python tools/build_desktop.py windows --architecture x86_64 -- --yes
-uv run python tools/build_desktop.py linux --architecture x86_64 -- --yes
-uv run python tools/build_desktop.py macos --architecture x86_64 -- --yes
-uv run python tools/build_desktop.py macos --architecture arm64 -- --yes
+uv run --locked --no-dev --group build python tools/build_desktop.py windows --architecture x86_64 -- --yes
+uv run --locked --no-dev --group build python tools/build_desktop.py linux --architecture x86_64 -- --yes
+uv run --locked --no-dev --group build python tools/build_desktop.py macos --architecture x86_64 -- --yes
+uv run --locked --no-dev --group build python tools/build_desktop.py macos --architecture arm64 -- --yes
 ```
 
 The release workflow builds separate Intel and Apple Silicon macOS bundles on
@@ -162,8 +174,8 @@ enables installer extraction into Android's read-only native-library directory:
 
 ```console
 uv sync --no-dev --group build
-uv run python -m tools.build_android apk -- --yes --split-per-abi
-uv run python -m tools.build_android aab -- --yes
+uv run --locked --no-dev --group build python -m tools.build_android apk -- --yes --split-per-abi
+uv run --locked --no-dev --group build python -m tools.build_android aab -- --yes
 ```
 
 The default Android build supports `arm64-v8a`, `armeabi-v7a`, and `x86_64`,
@@ -174,6 +186,8 @@ side-loadable APK as an architecture-specific artifact and uploads the Google
 Play App Bundle separately.
 
 ## Production release safeguards
+
+`musicplayer.__version__` is the authoritative release version. Package metadata, native build versions/numbers, tag validation, and artifact names derive from it. Flet/Flet Audio/Flet Desktop/Flet CLI and the local bridge have exact compatible pins; the bundled yt-dlp is also pinned. See the [release policy](docs/releases-and-dependencies.md) for the runtime update window and remaining native reproducibility work.
 
 The build wrappers are release-only. They reject development/staging
 environments, enabled debug flags, verbose/profile builds, disabled Python
@@ -213,3 +227,7 @@ protected `production` GitHub environment. Android releases additionally
 require `ANDROID_KEY_STORE_BASE64`, `ANDROID_KEY_STORE_PASSWORD`,
 `ANDROID_KEY_PASSWORD`, and `ANDROID_KEY_ALIAS` secrets; the workflow stops
 instead of falling back to Flet's debug signing key when any is missing.
+
+## License status
+
+A project license has not yet been selected. See [Contributing](CONTRIBUTING.md#licensing-status); this repository currently contains no new license grant for Melody or its local bridge.

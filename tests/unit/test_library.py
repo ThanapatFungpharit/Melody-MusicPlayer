@@ -223,7 +223,7 @@ class MusicManagerTests(unittest.TestCase):
 
         self.manager.replace_track_file(track_id, replacement)
 
-        self.assertEqual(self.manager.track_path(track_id), replacement)
+        self.assertTrue(self.manager.track_path(track_id).samefile(replacement))
         self.assertIsNone(self.manager.check_track_integrity(track_id))
         self.assertEqual(self.manager.playlist_tracks(playlist_id)[0].id, track_id)
 

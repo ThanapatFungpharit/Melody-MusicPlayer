@@ -3,8 +3,11 @@ from __future__ import annotations
 import os
 import re
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
+
+from musicplayer.core.storage import sync_directory
 
 COOKIE_FILE_NAME = "cookies.txt"
 MAX_COOKIE_FILE_SIZE = 10 * 1024 * 1024
@@ -52,6 +55,7 @@ def validate_cookie_file(content: bytes) -> ValidatedCookieFile:
         )
 
     cookie_count = 0
+    usable_count = 0
     for line_number, original_line in enumerate(lines[1:], start=2):
         line = original_line
         if line.startswith("#HttpOnly_"):
@@ -86,9 +90,15 @@ def validate_cookie_file(content: bytes) -> ValidatedCookieFile:
                     f"Invalid cookie expiry value on line {line_number}."
                 ) from error
         cookie_count += 1
+        if not expires or int(expires) == 0 or int(expires) > time.time():
+            usable_count += 1
 
     if not cookie_count:
         raise CookieFileError("The selected file does not contain any cookies.")
+    if not usable_count:
+        raise CookieFileError(
+            "All cookies in this file have expired. Export and upload a fresh cookies.txt file."
+        )
 
     normalized = "\n".join(lines).rstrip("\n") + "\n"
     return ValidatedCookieFile(normalized.encode("utf-8"), cookie_count)
@@ -109,6 +119,7 @@ def install_cookie_file(
             temporary_file.flush()
             os.fsync(temporary_file.fileno())
         os.replace(temporary_name, target)
+        sync_directory(target.parent)
         try:
             target.chmod(0o600)
         except OSError:

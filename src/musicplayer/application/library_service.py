@@ -1,19 +1,26 @@
 from __future__ import annotations
 
 import logging
-import shutil
 import time
 from collections.abc import Iterable
+from dataclasses import dataclass
 from pathlib import Path
 from uuid import UUID
 
 from musicplayer.core.library import MusicManager
 from musicplayer.core.library.models import Playlist, Track
+from musicplayer.core.storage import atomic_copy
 
 from .models import TrackDetails
 from .store import ApplicationStore
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class LibraryReconciliation:
+    missing_track_ids: tuple[str, ...]
+    unregistered_files: tuple[str, ...]
 
 
 class LibraryService:
@@ -23,6 +30,38 @@ class LibraryService:
 
     def details(self, track_id: UUID | str) -> TrackDetails:
         return self.store.track_details(str(track_id))
+
+    def reconcile(self) -> LibraryReconciliation:
+        """Repair stale secondary metadata and report ambiguous media safely.
+
+        Missing track records remain available for source-based repair. Files
+        without a download receipt are never adopted or deleted automatically.
+        """
+        with self.manager.mutation():
+            tracks = self.manager.list_tracks()
+            self.store.reconcile_track_references({str(track.id) for track in tracks})
+            paths = {self.manager.track_path(track.id).resolve() for track in tracks}
+            missing = tuple(
+                str(track.id)
+                for track in tracks
+                if not self.manager.track_path(track.id).is_file()
+            )
+            unregistered = tuple(
+                str(path)
+                for path in self.manager.music_folder.iterdir()
+                if path.is_file()
+                and not path.name.startswith(".")
+                and path.suffix.lower()
+                in {".mp3", ".m4a", ".opus", ".wav", ".flac", ".ogg", ".aac"}
+                and path.resolve() not in paths
+            )
+        if missing or unregistered:
+            logger.warning(
+                "Library reconciliation: %d missing tracks, %d unregistered files preserved",
+                len(missing),
+                len(unregistered),
+            )
+        return LibraryReconciliation(missing, unregistered)
 
     def update_details(self, track_id: UUID | str, **changes: object) -> TrackDetails:
         details = self.details(track_id)
@@ -64,6 +103,10 @@ class LibraryService:
         self.manager.rename_track(track_id, title)
 
     def import_local_file(self, source: str | Path) -> UUID:
+        with self.manager.mutation():
+            return self._import_local_file(source)
+
+    def _import_local_file(self, source: str | Path) -> UUID:
         """Copy an existing audio file into the managed folder and register it."""
         source_path = Path(source).resolve()
         if not source_path.is_file():
@@ -79,7 +122,7 @@ class LibraryService:
                 f"“{existing.title or existing.filename}” is already in the library"
             )
         destination = self._available_destination(source_path.name)
-        shutil.copy2(source_path, destination)
+        atomic_copy(source_path, destination)
         try:
             track_id = self.manager.add_track(
                 destination, source=source_path.as_uri(), title=source_path.stem

@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING, Any
 
 import flet as ft
 
-from musicplayer.core.library.models import Track
+from musicplayer.application.contracts import Track
 
 if TYPE_CHECKING:
     from musicplayer.ui._app_protocol import AppProtocol

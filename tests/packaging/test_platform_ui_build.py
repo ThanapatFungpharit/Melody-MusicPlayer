@@ -19,7 +19,7 @@ from tools.production_build import (
     required_ui_modules,
 )
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 PROJECT = ROOT / "pyproject.toml"
 
 # Import the real application from the compiled staging tree. The fixture creates

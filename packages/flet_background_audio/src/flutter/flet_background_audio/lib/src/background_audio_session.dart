@@ -72,6 +72,12 @@ class BackgroundAudioSessionService extends FletService {
     // so reinstall it whenever an inactive session is brought back.
     _installActionHandler();
     await _session.activate();
+    // Match Melody's transport controls and keep skip behavior consistent on
+    // Android notification controls, iOS lock screen, and desktop SMTC.
+    await _session.setSkipIntervals(
+      forwardSeconds: 10,
+      backwardSeconds: 10,
+    );
     // audioplayers already owns and handles audio focus. Enabling the media
     // shim's focus handler as well would make the two native focus requests
     // interrupt one another.
@@ -121,7 +127,10 @@ class BackgroundAudioSessionService extends FletService {
     final actions = <MediaAction>{
       MediaAction.play,
       MediaAction.pause,
+      MediaAction.stop,
       MediaAction.seekTo,
+      MediaAction.rewind,
+      MediaAction.fastForward,
       if (data["has_next"] as bool? ?? false) MediaAction.skipToNext,
       if (data["has_previous"] as bool? ?? false) MediaAction.skipToPrevious,
     };

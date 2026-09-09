@@ -1,27 +1,30 @@
 from __future__ import annotations
 
+import asyncio
 import random
 from collections import deque
 from dataclasses import dataclass, field
-from threading import RLock, Timer
+from threading import RLock
 from typing import TYPE_CHECKING, Any
 
 import flet as ft
 
-from musicplayer.application.downloads import DuplicateDownloadError
+from musicplayer.application.contracts import (
+    Playlist,
+    Track,
+    WorkerQueueFull,
+    source_key,
+)
 from musicplayer.application.models import SearchResult
 from musicplayer.application.providers import (
-    ProviderError,
     RemotePlaylist,
     is_youtube_playlist_url,
 )
-from musicplayer.core.concurrency import WorkerQueueFull
-from musicplayer.core.library.models import Playlist, Track
-from musicplayer.core.library.utils import source_key
 from musicplayer.ui.components.common import (
     _track_credit,
     _track_title,
 )
+from musicplayer.ui.tasks import page_action
 
 if TYPE_CHECKING:
     from musicplayer.ui._app_protocol import AppProtocol
@@ -58,7 +61,9 @@ class PlaylistsPage(_PlaylistBase):
         self.playlist_import_session: _PlaylistImportSession | None = None
         self.playlist_import_loading = False
         self.playlist_import_lock = RLock()
-        self.playlist_import_retry: Timer | None = None
+        self.playlist_import_retry = None
+        self._playlist_import_generation = 0
+        self._import_wakeup = asyncio.Event()
 
     def _playlists_view(self) -> ft.Control:
         return self.views._playlists_view(self)
@@ -95,9 +100,11 @@ class PlaylistsPage(_PlaylistBase):
     def _create_playlist_dialog(self) -> None:
         field = ft.TextField(label="Playlist name", autofocus=True)
 
-        def create(_: Any) -> None:
+        async def create(_: Any) -> None:
             try:
-                playlist_id = self.manager.create_playlist(field.value)
+                playlist_id = await self.tasks.io(
+                    self.manager.create_playlist, field.value
+                )
             except ValueError as error:
                 self._show_error(str(error))
                 return
@@ -138,7 +145,8 @@ class PlaylistsPage(_PlaylistBase):
                 return
             self.playlist_import_loading = True
             import_button.disabled = True
-            if self._submit_background(self._load_playlist_import, url):
+            self._load_playlist_import(url)
+            if True:
                 self.page.pop_dialog()
                 self._show_message("Loading the YouTube playlist…")
                 return
@@ -174,85 +182,165 @@ class PlaylistsPage(_PlaylistBase):
             )
         )
 
-    def _load_playlist_import(self, url: str) -> None:
+    @page_action
+    async def _load_playlist_import(self, url: str) -> None:
+        generation = self._playlist_import_generation
         try:
-            remote = self.providers.load_playlist(url)
-            self._begin_playlist_import(remote)
-        except (ProviderError, OSError, RuntimeError, ValueError) as error:
-            self._show_error(f"Couldn’t import that playlist: {error}")
+            remote = await self.tasks.io(self.providers.load_playlist, url)
+            if generation == self._playlist_import_generation:
+                await self._import_playlist(remote, generation)
         finally:
             self.playlist_import_loading = False
 
-    def _begin_playlist_import(self, remote: RemotePlaylist) -> None:
-        with self.playlist_import_lock:
-            if self.playlist_import_session is not None:
-                self._show_error("A playlist import is already in progress.")
-                return
+    @page_action
+    async def _begin_playlist_import(self, remote: RemotePlaylist) -> None:
+        await self._import_playlist(remote, self._playlist_import_generation)
 
-            unique: list[tuple[str, SearchResult]] = []
-            seen: set[str] = set()
-            for result in remote.tracks:
-                key = source_key(result.url)
-                if not result.url or not key or key in seen:
-                    continue
+    async def _import_playlist(self, remote: RemotePlaylist, generation: int) -> None:
+        if self.playlist_import_session is not None:
+            self._show_error("A playlist import is already in progress.")
+            return
+        # Lightweight page fixtures and older integrations provide only the
+        # original ``start`` API. Preserve that handoff while the production
+        # coordinator uses cancellable request/get semantics below.
+        if not hasattr(self.downloads, "request"):
+            await self._legacy_import_playlist(remote)
+            return
+        self.playlist_import_loading = True
+        name = remote.title.strip() or "Imported YouTube playlist"
+        unique = {source_key(item.url): item for item in remote.tracks if item.url}
+        playlist_id = str(await self.tasks.io(self.manager.create_playlist, name))
+        if generation != self._playlist_import_generation:
+            return
+        session = _PlaylistImportSession(
+            playlist_id, name, deque(unique.items()), tuple(unique)
+        )
+        self.playlist_import_session = session
+        self.selected_playlist_id = playlist_id
+        self._show_message(f"Importing {session.total} tracks into “{name}”…")
+        try:
+            while session.pending and self.playlist_import_session is session:
+                key, result = session.pending[0]
+                existing = await self.tasks.io(
+                    self.downloads.available_track, result.url
+                )
+                if self.playlist_import_session is not session:
+                    return
+                if existing is not None:
+                    session.resolved[key] = str(existing.id)
+                    session.reused += 1
+                else:
+                    try:
+                        was_active = self.downloads.is_source_active(result.url)
+                        task = await self.tasks.io(self.downloads.request, result)
+                    except WorkerQueueFull:
+                        await asyncio.sleep(0.2)
+                        continue
+                    except (OSError, RuntimeError, ValueError):
+                        session.failed += 1
+                        session.pending.popleft()
+                        continue
+                    if self.playlist_import_session is not session:
+                        if task is not None and not was_active:
+                            await self.tasks.io(self.downloads.cancel, str(task.id))
+                        return
+                    if task is None:
+                        continue
+                    session.waiting_key = key
+                    session.waiting_owned = not was_active
+                    session.waiting_task_id = str(task.id)
+                    while self.playlist_import_session is session:
+                        self._import_wakeup.clear()
+                        record = self.downloads.get(str(task.id))
+                        if record and record.status in {
+                            "completed",
+                            "failed",
+                            "cancelled",
+                        }:
+                            if record.status == "completed" and record.track_ids:
+                                session.resolved[key] = record.track_ids[0]
+                                session.downloaded += 1
+                            else:
+                                session.failed += 1
+                            break
+                        await self._import_wakeup.wait()
+                    if self.playlist_import_session is not session:
+                        return
+                session.waiting_key = session.waiting_task_id = None
+                session.waiting_owned = False
+                session.pending.popleft()
+                order = [
+                    session.resolved[item]
+                    for item in session.order
+                    if item in session.resolved
+                ]
+                await self.tasks.io(
+                    self.manager.merge_tracks_into_playlist, playlist_id, order
+                )
+                if (
+                    self.playlist_import_session is session
+                    and self.selected_navigation == 3
+                ):
+                    self.navigate(3)
+            self._finish_playlist_import(session)
+        finally:
+            self.playlist_import_loading = False
+            if self.playlist_import_session is session:
+                self.playlist_import_session = None
+
+    async def _legacy_import_playlist(self, remote: RemotePlaylist) -> None:
+        unique: list[tuple[str, SearchResult]] = []
+        seen: set[str] = set()
+        for result in remote.tracks:
+            key = source_key(result.url)
+            if result.url and key and key not in seen:
                 seen.add(key)
                 unique.append((key, result))
+        name = remote.title.strip() or "Imported YouTube playlist"
+        playlist_id = str(await self.tasks.io(self.manager.create_playlist, name))
+        session = _PlaylistImportSession(
+            playlist_id, name, deque(unique), tuple(key for key, _ in unique)
+        )
+        self.playlist_import_session = session
+        self.selected_playlist_id = playlist_id
+        self._legacy_advance(session)
 
-            name = remote.title.strip() or "Imported YouTube playlist"
-            playlist_id = str(self.manager.create_playlist(name))
-            resolved: dict[str, str] = {}
-            pending: deque[tuple[str, SearchResult]] = deque()
-            reused = 0
-            for key, result in unique:
-                resolver = getattr(self.downloads, "available_track", None)
-                existing = (
-                    resolver(result.url)
-                    if resolver is not None
-                    else self.manager.find_track_by_source(result.url)
-                )
-                if existing is None:
-                    pending.append((key, result))
-                    continue
-                resolved[key] = str(existing.id)
-                reused += 1
-
-            session = _PlaylistImportSession(
-                playlist_id=playlist_id,
-                name=name,
-                pending=pending,
-                order=tuple(key for key, _ in unique),
-                resolved=resolved,
-                reused=reused,
-            )
-            self.playlist_import_session = session
-            self.selected_playlist_id = playlist_id
-            self._sync_imported_playlist(session)
-            if self.selected_navigation == 3:
-                self.navigate(3)
-            if pending:
-                self._show_message(
-                    f"Importing {session.total} tracks into “{name}”: "
-                    f"reusing {reused}, downloading {len(pending)} missing."
-                )
-            self._continue_playlist_import()
+    def _legacy_advance(self, session: _PlaylistImportSession) -> None:
+        while session.pending:
+            key, result = session.pending[0]
+            existing = self.manager.find_track_by_source(result.url)
+            if existing is not None:
+                session.resolved[key] = str(existing.id)
+                session.reused += 1
+                session.pending.popleft()
+                continue
+            if session.waiting_key == key:
+                return
+            task = self.downloads.start(result)
+            session.waiting_key = key
+            session.waiting_owned = True
+            session.waiting_task_id = str(task.id)
+            break
+        self.manager.merge_tracks_into_playlist(
+            session.playlist_id,
+            [session.resolved[key] for key in session.order if key in session.resolved],
+        )
+        if not session.pending:
+            self._finish_playlist_import(session)
 
     def _continue_playlist_import(
-        self,
-        completed_url: str = "",
-        completed_track_ids: tuple[str, ...] = (),
+        self, completed_url: str = "", completed_track_ids: tuple[str, ...] = ()
     ) -> None:
-        with self.playlist_import_lock:
-            session = self.playlist_import_session
-            if session is None:
-                return
-            if not self.manager.has_playlist(session.playlist_id):
-                self._abandon_playlist_import(session.playlist_id)
-                self._show_error(
-                    f"Import of “{session.name}” stopped because its playlist was deleted."
+        session = self.playlist_import_session
+        if session is not None and not hasattr(self.downloads, "request"):
+            key, result = session.pending[0] if session.pending else ("", None)
+            if completed_url:
+                key = source_key(completed_url)
+                result = next(
+                    (item for item_key, item in session.pending if item_key == key),
+                    result,
                 )
-                return
-
-            completed_track_id = next(
+            completed_id = next(
                 (
                     track_id
                     for track_id in completed_track_ids
@@ -260,153 +348,48 @@ class PlaylistsPage(_PlaylistBase):
                 ),
                 None,
             )
-            if (
-                completed_url
-                and completed_track_id
-                and session.pending
-                and session.pending[0][0] == source_key(completed_url)
-            ):
-                key, _ = session.pending.popleft()
-                session.resolved[key] = completed_track_id
+            if completed_id and result is not None:
+                session.resolved[key] = completed_id
                 session.downloaded += 1
-                session.waiting_key = None
+                session.pending.popleft()
+                session.waiting_key = session.waiting_task_id = None
                 session.waiting_owned = False
-                session.waiting_task_id = None
-                self._sync_imported_playlist(session)
-
-            while session.pending:
-                key, result = session.pending[0]
+                self._legacy_advance(session)
+                return
+            if result is not None:
                 existing = self.manager.find_track_by_source(result.url)
                 if existing is not None:
                     session.resolved[key] = str(existing.id)
+                    session.downloaded += 1
                     session.pending.popleft()
-                    if session.waiting_key == key:
-                        session.downloaded += 1
-                    else:
-                        session.reused += 1
-                    session.waiting_key = None
+                    session.waiting_key = session.waiting_task_id = None
                     session.waiting_owned = False
-                    session.waiting_task_id = None
-                    self._sync_imported_playlist(session)
-                    continue
-
-                if session.waiting_key == key:
-                    if self.downloads.is_source_active(result.url):
-                        return
-                    if session.waiting_owned:
-                        session.failed += 1
-                        session.pending.popleft()
-                    session.waiting_key = None
-                    session.waiting_owned = False
-                    session.waiting_task_id = None
-                    continue
-
-                if self.downloads.is_source_active(result.url):
-                    session.waiting_key = key
-                    session.waiting_owned = False
-                    return
-
-                session.waiting_key = key
-                session.waiting_owned = True
-                try:
-                    requester = getattr(self.downloads, "request", None)
-                    task = (
-                        requester(result)
-                        if requester is not None
-                        else self.downloads.start(result)
-                    )
-                    if task is None:
-                        resolver = getattr(self.downloads, "available_track", None)
-                        existing = (
-                            resolver(result.url)
-                            if resolver is not None
-                            else self.manager.find_track_by_source(result.url)
-                        )
-                        if existing is None:
-                            raise RuntimeError(
-                                "The downloaded track is not available yet."
-                            )
-                        session.resolved[key] = str(existing.id)
-                        session.pending.popleft()
-                        session.reused += 1
-                        session.waiting_key = None
-                        session.waiting_owned = False
-                        session.waiting_task_id = None
-                        self._sync_imported_playlist(session)
-                        continue
-                    session.waiting_task_id = str(task.id)
-                except WorkerQueueFull:
-                    session.waiting_key = None
-                    session.waiting_owned = False
-                    session.waiting_task_id = None
-                    self._schedule_playlist_import_retry()
-                    return
-                except DuplicateDownloadError:
-                    if self.downloads.is_source_active(result.url):
-                        session.waiting_owned = False
-                        return
-                    session.failed += 1
-                    session.pending.popleft()
-                    session.waiting_key = None
-                    session.waiting_owned = False
-                    session.waiting_task_id = None
-                    continue
-                except (OSError, RuntimeError, ValueError):
-                    session.failed += 1
-                    session.pending.popleft()
-                    session.waiting_key = None
-                    session.waiting_owned = False
-                    session.waiting_task_id = None
-                    continue
-                return
-
-            self._finish_playlist_import(session)
-
-    def _schedule_playlist_import_retry(self) -> None:
-        if self.playlist_import_retry is not None:
+                    self._legacy_advance(session)
             return
-
-        def retry() -> None:
-            with self.playlist_import_lock:
-                self.playlist_import_retry = None
-            self._continue_playlist_import()
-
-        timer = Timer(0.1, retry)
-        timer.daemon = True
-        self.playlist_import_retry = timer
-        timer.start()
+        self._import_wakeup.set()
 
     def _cancel_playlist_import_retry(self) -> None:
-        timer = self.playlist_import_retry
-        self.playlist_import_retry = None
-        if timer is not None:
-            timer.cancel()
+        self._playlist_import_generation += 1
+        self._import_wakeup.set()
 
     def _abandon_playlist_import(self, playlist_id: str | None = None) -> bool:
-        lock = getattr(self, "playlist_import_lock", None)
-        if lock is None:
+        session = getattr(self, "playlist_import_session", None)
+        if playlist_id is not None and (
+            session is None or session.playlist_id != playlist_id
+        ):
             return False
-        with lock:
-            session = self.playlist_import_session
-            if session is None or (
-                playlist_id is not None and session.playlist_id != playlist_id
-            ):
-                return False
-            owned_task_id = session.waiting_task_id if session.waiting_owned else None
-            self.playlist_import_session = None
-            self._cancel_playlist_import_retry()
-            if owned_task_id is not None:
-                try:
-                    self.downloads.cancel(owned_task_id)
-                except (KeyError, RuntimeError, ValueError):
-                    pass
-            return True
-
-    def _sync_imported_playlist(self, session: _PlaylistImportSession) -> None:
-        imported_order = [
-            session.resolved[key] for key in session.order if key in session.resolved
-        ]
-        self.manager.merge_tracks_into_playlist(session.playlist_id, imported_order)
+        self._playlist_import_generation = (
+            getattr(self, "_playlist_import_generation", 0) + 1
+        )
+        self.playlist_import_session = None
+        wakeup = getattr(self, "_import_wakeup", None)
+        if wakeup is not None:
+            wakeup.set()
+        if session is not None and session.waiting_owned and session.waiting_task_id:
+            self.tasks.submit(
+                lambda: self.downloads.cancel(session.waiting_task_id), lambda _: None
+            )
+        return session is not None
 
     def _finish_playlist_import(self, session: _PlaylistImportSession) -> None:
         if self.playlist_import_session is not session:
@@ -428,9 +411,11 @@ class PlaylistsPage(_PlaylistBase):
     def _rename_playlist_dialog(self, playlist: Playlist) -> None:
         field = ft.TextField(label="Playlist name", value=playlist.name, autofocus=True)
 
-        def save(_: Any) -> None:
+        async def save(_: Any) -> None:
             try:
-                self.manager.rename_playlist(playlist.id, field.value)
+                await self.tasks.io(
+                    self.manager.rename_playlist, playlist.id, field.value
+                )
             except ValueError as error:
                 self._show_error(str(error))
                 return
@@ -452,11 +437,14 @@ class PlaylistsPage(_PlaylistBase):
 
     def _delete_playlist_dialog(self, playlist: Playlist) -> None:
         def confirm(_: Any) -> None:
-            self.manager.delete_playlist(playlist.id)
-            self._abandon_playlist_import(str(playlist.id))
-            self.page.pop_dialog()
-            self.selected_playlist_id = None
-            self.navigate(3)
+            async def commit() -> None:
+                await self.tasks.io(self.manager.delete_playlist, playlist.id)
+                self._abandon_playlist_import(str(playlist.id))
+                self.page.pop_dialog()
+                self.selected_playlist_id = None
+                self.navigate(3)
+
+            self.tasks.start(lambda: commit())
 
         self.page.show_dialog(
             ft.AlertDialog(
@@ -473,8 +461,9 @@ class PlaylistsPage(_PlaylistBase):
             )
         )
 
-    def _add_to_playlist(self, playlist_id: str, track_id: str) -> None:
-        self.manager.add_to_playlist(playlist_id, track_id)
+    @page_action
+    async def _add_to_playlist(self, playlist_id: str, track_id: str) -> None:
+        await self.tasks.io(self.manager.add_to_playlist, playlist_id, track_id)
         self._show_message("Added to playlist.")
 
     def _bulk_add_tracks_dialog(self, playlist: Playlist) -> None:
@@ -526,16 +515,22 @@ class PlaylistsPage(_PlaylistBase):
             ]
             if not track_ids:
                 return
-            try:
-                added = self.manager.add_tracks_to_playlist(playlist.id, track_ids)
-            except (KeyError, ValueError) as error:
-                self._show_error(str(error))
-                return
-            self.page.pop_dialog()
-            self.navigate(3)
-            self._show_message(
-                f"Added {added} track{'s' if added != 1 else ''} to “{playlist.name}”."
-            )
+
+            async def commit() -> None:
+                try:
+                    added = await self.tasks.io(
+                        self.manager.add_tracks_to_playlist, playlist.id, track_ids
+                    )
+                except (KeyError, ValueError) as error:
+                    self._show_error(str(error))
+                    return
+                self.page.pop_dialog()
+                self.navigate(3)
+                self._show_message(
+                    f"Added {added} track{'s' if added != 1 else ''} to “{playlist.name}”."
+                )
+
+            self.tasks.start(lambda: commit())
 
         select_all.on_change = toggle_all
         for checkbox in checkboxes:
@@ -595,11 +590,13 @@ class PlaylistsPage(_PlaylistBase):
             )
         )
 
-    def _remove_from_playlist(self, playlist_id: str, track_id: str) -> None:
-        self.manager.remove_from_playlist(playlist_id, track_id)
+    @page_action
+    async def _remove_from_playlist(self, playlist_id: str, track_id: str) -> None:
+        await self.tasks.io(self.manager.remove_from_playlist, playlist_id, track_id)
         self.navigate(3)
 
-    def _reorder_playlist(
+    @page_action
+    async def _reorder_playlist(
         self, playlist_id: str, old_index: int | None, new_index: int | None
     ) -> None:
         if old_index is None or new_index is None:
@@ -610,16 +607,21 @@ class PlaylistsPage(_PlaylistBase):
         if new_index > old_index:
             new_index -= 1
         ordered.insert(max(0, min(new_index, len(ordered))), item)
-        self.manager.reorder_playlist(playlist_id, ordered)
+        await self.tasks.io(self.manager.reorder_playlist, playlist_id, ordered)
         self.navigate(3)
 
-    def _transfer_playlist_track(
+    @page_action
+    async def _transfer_playlist_track(
         self, source: str, target: str, track_id: str, *, move: bool
     ) -> None:
         if move:
-            self.manager.move_track_between_playlists(source, target, track_id)
+            await self.tasks.io(
+                self.manager.move_track_between_playlists, source, target, track_id
+            )
         else:
-            self.manager.copy_playlist_track(source, target, track_id)
+            await self.tasks.io(
+                self.manager.copy_playlist_track, source, target, track_id
+            )
         self.navigate(3)
 
     def _playlist_track_menu(

@@ -1,14 +1,15 @@
 [project]
 name = "musicplayer"
-version = "0.1.0"
+dynamic = ["version"]
 description = "A cross-platform local music player application"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "flet>=0.86.5",
-    "flet-audio>=0.86.5",
-    "flet-background-audio>=0.1.0",
-    "yt-dlp",
+    "flet==0.86.5",
+    "flet-audio==0.86.5",
+    "flet-background-audio==0.1.0",
+    "packaging>=24.0",
+    "yt-dlp==2026.8.19",
 ]
 
 [project.scripts]
@@ -20,6 +21,9 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.dynamic]
+version = { attr = "musicplayer.__version__" }
 
 [tool.setuptools.package-data]
 musicplayer = ["bin/*/*/*"]
@@ -64,7 +68,6 @@ exclude = [
     ".flet",
     "__pycache__",
     "musicplayer/__main__.py",
-    'musicplayer\__main__.py',
 ]
 
 [tool.flet.android]
@@ -91,7 +94,7 @@ build = [
     "flet-cli==0.86.5",
 ]
 dev = [
-    "flet-desktop>=0.86.5",
+    "flet-desktop==0.86.5",
     "ruff>=0.16.3",
     "ty>=0.0.78",
 ]

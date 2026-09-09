@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Any
 import flet as ft
 
 from musicplayer.application.models import DownloadRecord
+from musicplayer.ui.tasks import page_action
 
 if TYPE_CHECKING:
     from musicplayer.ui._app_protocol import AppProtocol
@@ -31,20 +32,23 @@ class DownloadsPage(_Base):
     def _download_row(self, record: DownloadRecord) -> ft.Control:
         return self.views._download_row(self, record)
 
-    def _cancel_download(self, record_id: str) -> None:
+    @page_action
+    async def _cancel_download(self, record_id: str) -> None:
         try:
-            self.downloads.cancel(record_id)
+            await self.tasks.io(self.downloads.cancel, record_id)
         except ValueError as error:
             self._show_error(str(error))
 
-    def _retry_download(self, record_id: str) -> None:
+    @page_action
+    async def _retry_download(self, record_id: str) -> None:
         try:
-            self.downloads.retry(record_id)
+            await self.tasks.io(self.downloads.retry, record_id)
         except (ValueError, OSError) as error:
             self._show_error(str(error))
 
-    def _clear_downloads(self) -> None:
-        self.downloads.clear_finished()
+    @page_action
+    async def _clear_downloads(self) -> None:
+        await self.tasks.io(self.downloads.clear_finished)
         self._refresh_download_badge()
         if self.active_panel == "downloads":
             self._refresh_context_panel()

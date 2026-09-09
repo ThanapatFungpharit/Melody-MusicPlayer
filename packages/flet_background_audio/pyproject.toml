@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Melody's Flet bridge for background playback and system media controls"
 requires-python = ">=3.10"
 dependencies = [
-    "flet>=0.86.5",
+    "flet==0.86.5",
 ]
 
 [tool.setuptools.package-data]

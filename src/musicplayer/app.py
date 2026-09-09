@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +13,7 @@ from musicplayer.application.downloads import DownloadCoordinator
 from musicplayer.application.library_service import LibraryService
 from musicplayer.application.models import DownloadRecord
 from musicplayer.application.playback import PlaybackController
+from musicplayer.application.playback_persistence import PlaybackPersistence
 from musicplayer.application.providers import ProviderRegistry
 from musicplayer.application.store import ApplicationStore
 from musicplayer.core.concurrency import LazyBoundedExecutor, WorkerQueueFull
@@ -50,6 +53,7 @@ from musicplayer.ui.pages import (
     SettingsPage,
 )
 from musicplayer.ui.presentation import PresentationKind, presentation_kind
+from musicplayer.ui.tasks import PageTasks
 from musicplayer.ui.theme import accent_color, build_theme
 
 logger = logging.getLogger(__name__)
@@ -100,22 +104,48 @@ class MusicPlayerApp(
 
         return desktop
 
-    def __init__(self, page: ft.Page) -> None:
+    def __getattr__(self, name: str) -> Any:
+        # Small, synchronous fixtures and embedders sometimes construct the
+        # composition root with ``__new__`` to exercise one page workflow. Keep
+        # those callers on the same I/O boundary without requiring a full app
+        # startup; normal pages initialize ``tasks`` eagerly in ``__init__``.
+        if name == "tasks" and "page" in self.__dict__:
+            tasks = PageTasks(
+                self.page,
+                LazyBoundedExecutor(
+                    max_workers=1,
+                    max_pending=1,
+                    thread_name_prefix="melody-fixture",
+                ),
+                getattr(self, "_show_error", lambda _: None),
+            )
+            self.__dict__[name] = tasks
+            return tasks
+        raise AttributeError(name)
+
+    def __init__(self, page: ft.Page, resources: AppResources | None = None) -> None:
         self.page = page
-        self.data_directory = _application_data_directory()
-        self.store = ApplicationStore(self.data_directory / "state.json")
-        self.settings = self.store.settings
-        self.manager = MusicManager(
-            self.data_directory / "library.mmdb", self.settings.download_directory
-        )
-        self.library = LibraryService(self.manager, self.store)
-        self.providers = ProviderRegistry(settings=self.settings)
+        resources = resources or AppResources.load()
+        self.data_directory = resources.directory
+        self.store = resources.store
+        self.settings = resources.store.settings
+        self.manager = resources.manager
+        self.library = resources.library
+        self.reconciliation = resources.reconciliation
+        self.providers = resources.providers
         # Search, stream resolution, and imports share a bounded I/O pool that
         # exists only while at least one background operation is in flight.
         self.workers = LazyBoundedExecutor(
             max_workers=2,
             max_pending=2,
             thread_name_prefix="melody-io",
+        )
+        self.tasks = PageTasks(page, self.workers, self._show_error)
+        self.playback_workers = LazyBoundedExecutor(
+            max_workers=2, max_pending=1, thread_name_prefix="melody-playback"
+        )
+        self.persistence = PlaybackPersistence(
+            self.store, lambda message: self.tasks.dispatch(self._show_error, message)
         )
         self._system_media_key: tuple[str, ...] | None = None
         self._system_media_metadata = ("", "", "", "")
@@ -129,11 +159,15 @@ class MusicPlayerApp(
             self.library,
             self.store,
             self.backend,
-            io_executor=self.workers,
+            io_executor=self.playback_workers,
+            persistence=self.persistence,
+            dispatch=self.tasks.dispatch,
+            available_track_ids=resources.available_track_ids,
             on_change=self._playback_changed,
             on_error=self._show_error,
         )
         self.backend.bind(
+            on_loaded=self.playback.on_loaded,
             on_position=self.playback.on_position,
             on_duration=self.playback.on_duration,
             on_playing=self.playback.on_playing,
@@ -141,11 +175,9 @@ class MusicPlayerApp(
             on_error=self.playback.on_backend_error,
             on_media_action=self._media_action,
         )
-        self.downloads = DownloadCoordinator(
-            self.manager,
-            self.store,
-            self.settings,
-            on_change=self._download_changed,
+        self.downloads = resources.downloads
+        self.downloads.on_change = lambda record: self.tasks.dispatch(
+            self._download_changed, record
         )
         self.selected_navigation = 0
         self._initialize_search_page()
@@ -153,6 +185,7 @@ class MusicPlayerApp(
         self._initialize_playlists_page()
         self.active_panel: str | None = None
         self.pending_download_actions: dict[str, tuple[str, str | None]] = {}
+        self._download_play_requests: dict[str, int] = {}
         self._last_announced_track: str | None = None
         self.presentation = presentation_kind(
             page.platform, native_mobile=self._is_mobile_platform()
@@ -184,7 +217,18 @@ class MusicPlayerApp(
             self.page.window.min_height = 700
         self.page.on_keyboard_event = self._keyboard_event
         self.page.on_resize = self._page_resized
+        self.page.on_app_lifecycle_state_change = self._app_lifecycle_changed
         self.page.on_close = self._close
+
+    def _app_lifecycle_changed(self, event: ft.AppLifecycleStateChangeEvent) -> None:
+        """Refresh native playback state after the page returns to the foreground."""
+        if event.state not in (ft.AppLifecycleState.SHOW, ft.AppLifecycleState.RESUME):
+            return
+        self.backend.refresh_state()
+        # Refresh the session immediately with the current controller state;
+        # the native position query above will publish a precise correction as
+        # soon as it completes.
+        self._sync_system_media(refresh_metadata=False)
 
     def _playback_changed(self, change: str = "state") -> None:
         if change != "volume":
@@ -300,7 +344,13 @@ class MusicPlayerApp(
         pending = self.pending_download_actions.get(record.id)
         if pending and record.status in {"completed", "failed", "cancelled"}:
             self.pending_download_actions.pop(record.id, None)
-            if record.status == "completed":
+            generation = self._download_play_requests.pop(record.id, None)
+            relevant = pending[0] != "play" or (
+                generation is not None and self.playback.is_current_request(generation)
+            )
+            if not relevant:
+                pass
+            elif record.status == "completed":
                 self._apply_track_action(record.track_ids, *pending)
             else:
                 self._show_error(
@@ -314,7 +364,11 @@ class MusicPlayerApp(
                 record.url,
                 tuple(record.track_ids) if record.status == "completed" else (),
             )
-        if self.selected_navigation == 2 and hasattr(self, "library_list"):
+        if (
+            record.status in {"completed", "failed", "cancelled"}
+            and self.selected_navigation == 2
+            and hasattr(self, "library_list")
+        ):
             self._refresh_library_list()
         if self.active_panel == "downloads":
             self._refresh_context_panel()
@@ -355,13 +409,13 @@ class MusicPlayerApp(
 
     def _close(self, _: Any) -> None:
         self._cancel_playlist_import_retry()
+        self.playback.close()
         self.backend.close()
-        self.downloads.shutdown()
-        self.workers.shutdown(wait=False, cancel_pending=True)
-        self.store.set(
-            "playback",
-            self.playback.queue.to_dict(position_ms=self.playback.position_ms),
-        )
+        self.tasks.close()
+        self.persistence.close(wait=True)
+        self.playback_workers.shutdown(wait=True, cancel_pending=True)
+        self.downloads.shutdown(wait=True)
+        self.workers.shutdown(wait=True, cancel_pending=True)
 
     def _submit_background(
         self, operation: Callable[..., object], /, *args: object
@@ -393,9 +447,58 @@ class MusicPlayerApp(
         self._show_message(public_error_message(message), error=True)
 
 
-def main(page: ft.Page) -> None:
+@dataclass
+class AppResources:
+    directory: Path
+    store: ApplicationStore
+    manager: MusicManager
+    library: LibraryService
+    reconciliation: Any
+    providers: ProviderRegistry
+    downloads: DownloadCoordinator
+    available_track_ids: set[str]
+
+    @classmethod
+    def load(cls) -> AppResources:
+        """All startup filesystem, recovery and provider initialization is worker-only."""
+        directory = _application_data_directory()
+        store = ApplicationStore(directory / "state.json")
+        settings = store.settings
+        manager = MusicManager(directory / "library.mmdb", settings.download_directory)
+        library = LibraryService(manager, store)
+        reconciliation = library.reconcile()
+        providers = ProviderRegistry(settings=settings)
+        downloads = DownloadCoordinator(manager, store, settings)
+        available = {
+            str(track.id)
+            for track in manager.list_tracks()
+            if manager.track_path(track.id).is_file()
+        }
+        return cls(
+            directory,
+            store,
+            manager,
+            library,
+            reconciliation,
+            providers,
+            downloads,
+            available,
+        )
+
+
+async def main(page: ft.Page) -> None:
+    page.title = "Melody — Loading library"
+    loading = ft.Column(
+        [ft.ProgressRing(), ft.Text("Loading your library…")],
+        alignment=ft.MainAxisAlignment.CENTER,
+        horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+        expand=True,
+    )
+    page.add(loading)
     try:
-        MusicPlayerApp(page)
+        resources = await asyncio.to_thread(AppResources.load)
+        page.controls.clear()
+        MusicPlayerApp(page, resources)
     except Exception:  # noqa: BLE001 - final UI boundary must stay user-safe
         logger.error("Melody failed to start")
         page.title = "Melody — Startup error"

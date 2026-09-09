@@ -8,6 +8,15 @@ from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 
+if __package__:
+    from tools.release_version import build_number, release_version, validate_tag
+else:
+    from release_version import (  # ty: ignore[unresolved-import]
+        build_number,
+        release_version,
+        validate_tag,
+    )
+
 RELEASE_PYTHON_VERSION = "3.13"
 TARGET_PRESENTATIONS = {
     "windows": "desktop",
@@ -52,6 +61,8 @@ _FORBIDDEN_FLET_ARGUMENTS = {
     "--no-compile-app",
     "--no-compile-packages",
     "--python-version",
+    "--build-version",
+    "--build-number",
 }
 _FORBIDDEN_FLET_PREFIXES = tuple(
     f"{argument}=" for argument in _FORBIDDEN_FLET_ARGUMENTS
@@ -176,15 +187,28 @@ def platform_flet_arguments(
     opposite = "mobile" if presentation == "desktop" else "desktop"
     with project_file.open("rb") as stream:
         config = tomllib.load(stream)["tool"]["flet"]
+    version = release_version()
+    validate_tag(version, os.environ.get("GITHUB_REF", ""))
     config_platform = "android" if target in {"apk", "aab"} else target
     exclusions = [
         *config.get("app", {}).get("exclude", []),
         *config.get(config_platform, {}).get("app", {}).get("exclude", []),
         f"musicplayer/ui/{opposite}",
-        f"musicplayer\\ui\\{opposite}",
     ]
+    canonical_exclusions = dict.fromkeys(path.replace("\\", "/") for path in exclusions)
+    exclusions = list(
+        dict.fromkeys(
+            spelling
+            for path in canonical_exclusions
+            for spelling in (path, path.replace("/", "\\"))
+        )
+    )
     return [
         *hardened_flet_arguments(arguments),
+        "--build-version",
+        version,
+        "--build-number",
+        str(build_number(version)),
         "--exclude",
         *dict.fromkeys(exclusions),
     ]

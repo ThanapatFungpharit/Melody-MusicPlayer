@@ -495,7 +495,9 @@ class ProviderMappingTests(unittest.TestCase):
         with self.assertRaisesRegex(ProviderError, "playlist URL"):
             provider.load_playlist("https://youtu.be/video-id")
 
-    def test_search_retries_anonymously_when_cookie_file_cannot_load(self) -> None:
+    def test_search_reports_cookie_failure_without_changing_authentication(
+        self,
+    ) -> None:
         provider = YtDlpProvider(yt_dlp_options={"cookiefile": "/private/cookies.txt"})
         with patch("musicplayer.application.providers.YoutubeDL") as youtube_dl:
             authenticated = youtube_dl.return_value.__enter__.return_value
@@ -503,11 +505,11 @@ class ProviderMappingTests(unittest.TestCase):
                 CookieLoadError("failed to load cookies"),
                 {"entries": []},
             ]
-            provider.search("focus music")
+            with self.assertRaisesRegex(ProviderError, "cookie file"):
+                provider.search("focus music")
 
-        self.assertEqual(youtube_dl.call_count, 2)
+        self.assertEqual(youtube_dl.call_count, 1)
         self.assertIn("cookiefile", youtube_dl.call_args_list[0].args[0])
-        self.assertNotIn("cookiefile", youtube_dl.call_args_list[1].args[0])
 
     def test_search_entries_map_to_typed_results(self) -> None:
         info = {

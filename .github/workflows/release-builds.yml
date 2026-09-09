@@ -7,28 +7,22 @@ on:
       - "v*"
 
 jobs:
-  validate-ui:
-    name: Validate shared logic and platform UIs
+  preflight:
+    name: Validate release version
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v6
-      - uses: astral-sh/setup-uv@v9.0.0
-        with:
-          enable-cache: true
-          cache-suffix: ui-validation
-      - name: Install validation tools for the packaged Python version
-        run: uv sync --frozen --python 3.13 --group build --group dev
-      - name: Test both UIs, including isolated compiled packages
-        run: uv run --frozen --python 3.13 --group build --group dev python -m unittest discover -s tests -v
-      - name: Lint and check formatting
-        run: |
-          uv run --frozen --python 3.13 --group build --group dev ruff check src tests tools
-          uv run --frozen --python 3.13 --group build --group dev ruff format --check src tests tools
-      - name: Check types
-        run: uv run --frozen --python 3.13 --group build --group dev ty check src tests tools
+      - id: version
+        run: python tools/release_version.py
+
+  validate-ui:
+    needs: preflight
+    uses: ./.github/workflows/validate.yml
 
   windows:
-    needs: validate-ui
+    needs: [preflight, validate-ui]
     environment: production
     runs-on: windows-latest
     env:
@@ -45,29 +39,29 @@ jobs:
         with:
           enable-cache: true
       - name: Install isolated release toolchain
-        run: uv sync --frozen --no-dev --group build
+        run: uv sync --locked --python 3.13 --no-dev --group build
       - name: Build desktop bundle
         shell: bash
         run: >-
-          uv run --frozen --no-dev --group build python tools/build_desktop.py
+          uv run --locked --python 3.13 --no-dev --group build python tools/build_desktop.py
           windows
           --architecture x86_64
           -- --yes
       - name: Verify production artifact
         run: >-
-          uv run --frozen --no-dev --group build python
+          uv run --locked --python 3.13 --no-dev --group build python
           tools/verify_production_artifact.py
           --target windows
           build/windows
       - name: Upload desktop bundle
         uses: actions/upload-artifact@v7
         with:
-          name: melody-windows-x86_64
+          name: melody-windows-x86_64-${{ needs.preflight.outputs.version }}
           path: build/windows
           if-no-files-found: error
 
   linux:
-    needs: validate-ui
+    needs: [preflight, validate-ui]
     environment: production
     runs-on: ubuntu-latest
     env:
@@ -84,33 +78,33 @@ jobs:
         with:
           enable-cache: true
       - name: Install isolated release toolchain
-        run: uv sync --frozen --no-dev --group build
+        run: uv sync --locked --python 3.13 --no-dev --group build
       - name: Install Linux build dependencies
         run: sudo apt-get update && sudo apt-get install -y ninja-build pkg-config libgtk-3-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
       - name: Build desktop bundle
         shell: bash
         run: >-
-          uv run --frozen --no-dev --group build python tools/build_desktop.py
+          uv run --locked --python 3.13 --no-dev --group build python tools/build_desktop.py
           linux
           --architecture x86_64
           -- --yes
       - name: Verify production artifact
         run: >-
-          uv run --frozen --no-dev --group build python
+          uv run --locked --python 3.13 --no-dev --group build python
           tools/verify_production_artifact.py
           --target linux
           build/linux
       - name: Archive Linux bundle with executable permissions
-        run: tar -czf build/melody-linux-x86_64.tar.gz -C build/linux .
+        run: tar -czf build/melody-linux-x86_64-${{ needs.preflight.outputs.version }}.tar.gz -C build/linux .
       - name: Upload desktop bundle
         uses: actions/upload-artifact@v7
         with:
-          name: melody-linux-x86_64
-          path: build/melody-linux-x86_64.tar.gz
+          name: melody-linux-x86_64-${{ needs.preflight.outputs.version }}
+          path: build/melody-linux-x86_64-${{ needs.preflight.outputs.version }}.tar.gz
           if-no-files-found: error
 
   macos:
-    needs: validate-ui
+    needs: [preflight, validate-ui]
     environment: production
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -142,11 +136,11 @@ jobs:
           xcodebuild -version
           xcrun --sdk macosx --show-sdk-version
       - name: Install isolated release toolchain
-        run: uv sync --frozen --no-dev --group build
+        run: uv sync --locked --python 3.13 --no-dev --group build
       - name: Build desktop bundle
         shell: bash
         run: >-
-          uv run --frozen --no-dev --group build python tools/build_desktop.py
+          uv run --locked --python 3.13 --no-dev --group build python tools/build_desktop.py
           macos
           --architecture ${{ matrix.architecture }}
           -- --yes
@@ -163,21 +157,21 @@ jobs:
           fi
       - name: Verify production artifact
         run: >-
-          uv run --frozen --no-dev --group build python
+          uv run --locked --python 3.13 --no-dev --group build python
           tools/verify_production_artifact.py
           --target macos
           build/macos
       - name: Archive macOS bundle with permissions and symlinks
-        run: tar -czf build/melody-macos-${{ matrix.architecture }}.tar.gz -C build/macos .
+        run: tar -czf build/melody-macos-${{ matrix.architecture }}-${{ needs.preflight.outputs.version }}.tar.gz -C build/macos .
       - name: Upload desktop bundle
         uses: actions/upload-artifact@v7
         with:
-          name: melody-macos-${{ matrix.architecture }}
-          path: build/melody-macos-${{ matrix.architecture }}.tar.gz
+          name: melody-macos-${{ matrix.architecture }}-${{ needs.preflight.outputs.version }}
+          path: build/melody-macos-${{ matrix.architecture }}-${{ needs.preflight.outputs.version }}.tar.gz
           if-no-files-found: error
 
   android:
-    needs: validate-ui
+    needs: [preflight, validate-ui]
     environment: production
     runs-on: ubuntu-latest
     env:
@@ -193,8 +187,6 @@ jobs:
       - uses: astral-sh/setup-uv@v9.0.0
         with:
           enable-cache: true
-      - name: Install isolated release toolchain
-        run: uv sync --frozen --no-dev --group build
       - name: Configure Android release signing
         shell: bash
         env:
@@ -215,40 +207,42 @@ jobs:
           echo "FLET_ANDROID_SIGNING_KEY_STORE_PASSWORD=$ANDROID_KEY_STORE_PASSWORD" >> "$GITHUB_ENV"
           echo "FLET_ANDROID_SIGNING_KEY_PASSWORD=$ANDROID_KEY_PASSWORD" >> "$GITHUB_ENV"
           echo "FLET_ANDROID_SIGNING_KEY_ALIAS=$ANDROID_KEY_ALIAS" >> "$GITHUB_ENV"
+      - name: Install isolated release toolchain
+        run: uv sync --locked --python 3.13 --no-dev --group build
       - name: Build Android APK
         run: >-
-          uv run --frozen --no-dev --group build python -m tools.build_android apk
+          uv run --locked --python 3.13 --no-dev --group build python -m tools.build_android apk
           -- --yes --split-per-abi
       - name: Build Android App Bundle
         run: >-
-          uv run --frozen --no-dev --group build python -m tools.build_android aab
+          uv run --locked --python 3.13 --no-dev --group build python -m tools.build_android aab
           -- --yes
       - name: Verify production artifacts
         run: |
-          uv run --frozen --no-dev --group build python tools/verify_production_artifact.py --target apk build/apk
-          uv run --frozen --no-dev --group build python tools/verify_production_artifact.py --target aab build/aab
+          uv run --locked --python 3.13 --no-dev --group build python tools/verify_production_artifact.py --target apk build/apk
+          uv run --locked --python 3.13 --no-dev --group build python tools/verify_production_artifact.py --target aab build/aab
       - name: Upload Android arm64-v8a APK
         uses: actions/upload-artifact@v7
         with:
-          name: melody-android-arm64-v8a
+          name: melody-android-arm64-v8a-${{ needs.preflight.outputs.version }}
           path: build/apk/melody-arm64-v8a.apk
           if-no-files-found: error
       - name: Upload Android armeabi-v7a APK
         uses: actions/upload-artifact@v7
         with:
-          name: melody-android-armeabi-v7a
+          name: melody-android-armeabi-v7a-${{ needs.preflight.outputs.version }}
           path: build/apk/melody-armeabi-v7a.apk
           if-no-files-found: error
       - name: Upload Android x86_64 APK
         uses: actions/upload-artifact@v7
         with:
-          name: melody-android-x86_64
+          name: melody-android-x86_64-${{ needs.preflight.outputs.version }}
           path: build/apk/melody-x86_64.apk
           if-no-files-found: error
       - name: Upload Android App Bundle
         uses: actions/upload-artifact@v7
         with:
-          name: melody-android-aab
+          name: melody-android-aab-${{ needs.preflight.outputs.version }}
           path: build/aab/melody.aab
           if-no-files-found: error
 

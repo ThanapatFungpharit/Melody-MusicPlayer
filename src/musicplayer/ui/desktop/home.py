@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING, Any
 
 import flet as ft
 
-from musicplayer.core.library.models import Track
+from musicplayer.application.contracts import Track
 from musicplayer.ui.components.common import (
     _artwork,
     _empty_state,

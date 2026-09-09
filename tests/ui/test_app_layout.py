@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import Mock
 from uuid import UUID
 
@@ -111,6 +112,30 @@ class AppLayoutTests(unittest.TestCase):
             app.backend.sync_media_session.call_args_list[-1].kwargs["position_ms"],
             2000,
         )
+
+    def test_foreground_resume_reconciles_native_playback_state(self) -> None:
+        app = self._app()
+        app.backend = Mock()
+        app._sync_system_media = Mock()
+
+        app._app_lifecycle_changed(
+            cast(
+                ft.AppLifecycleStateChangeEvent,
+                SimpleNamespace(state=ft.AppLifecycleState.PAUSE),
+            )
+        )
+        app.backend.refresh_state.assert_not_called()
+        app._sync_system_media.assert_not_called()
+
+        app._app_lifecycle_changed(
+            cast(
+                ft.AppLifecycleStateChangeEvent,
+                SimpleNamespace(state=ft.AppLifecycleState.RESUME),
+            )
+        )
+
+        app.backend.refresh_state.assert_called_once_with()
+        app._sync_system_media.assert_called_once_with(refresh_metadata=False)
 
     def test_settings_uses_responsive_sections_and_fixed_footer(self) -> None:
         app = self._app()

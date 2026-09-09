@@ -42,12 +42,12 @@ class FakeAudioBackend:
 
 class DeferredExecutor:
     def __init__(self) -> None:
-        self.future: Future[bytes] | None = None
-        self.futures: list[Future[bytes]] = []
+        self.future: Future[str | bytes] | None = None
+        self.futures: list[Future[str | bytes]] = []
         self.function = None
         self.args: tuple[object, ...] = ()
 
-    def submit(self, function, /, *args) -> Future[bytes]:
+    def submit(self, function, /, *args) -> Future[str | bytes]:
         self.function = function
         self.args = args
         self.future = Future()
@@ -441,6 +441,35 @@ class PlaybackControllerTests(unittest.TestCase):
             self.assertEqual(backend.played_at, [0, 0])
             controller.on_playing(True)
             self.assertEqual(store.track_details(str(track_id)).play_count, 1)
+
+    def test_backend_failure_cancels_a_pending_background_source_read(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            music = root / "music"
+            music.mkdir()
+            path = music / "song.mp3"
+            path.write_bytes(b"audio")
+            manager = MusicManager(root / "library.mmdb", music)
+            track_id = manager.add_track(path, title="Song")
+            store = ApplicationStore(root / "state.json")
+            executor = DeferredExecutor()
+            controller = PlaybackController(
+                manager,
+                LibraryService(manager, store),
+                store,
+                FakeAudioBackend(),
+                io_executor=executor,
+            )
+
+            controller.play_track(str(track_id))
+            pending = executor.future
+            controller.on_backend_error("native load failed")
+
+            self.assertIsNotNone(pending)
+            assert pending is not None
+            self.assertTrue(pending.cancelled())
+            self.assertFalse(controller._loading)
+            self.assertFalse(controller._source_loaded)
 
 
 if __name__ == "__main__":

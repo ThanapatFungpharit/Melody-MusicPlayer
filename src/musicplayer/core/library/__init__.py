@@ -8,9 +8,12 @@ import tempfile
 import threading
 import time
 from collections.abc import Iterator, Sequence
-from dataclasses import replace
+from contextlib import contextmanager
+from dataclasses import dataclass, replace
 from pathlib import Path
 from uuid import UUID, uuid4
+
+from musicplayer.core.storage import sync_directory
 
 from .config import HEADER, MAGIC, SHA256_BYTES, TRACK_FIXED, U32, UUID_ONLY, VERSION
 from .models import IntegrityProblem, Playlist, Track
@@ -19,7 +22,21 @@ from .utils import _as_uuid, _pack_utf8_string, _read_utf8_string, _sha256, sour
 logger = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class _LibraryReadState:
+    tracks: dict[UUID, Track]
+    playlists: dict[UUID, Playlist]
+    sources: dict[str, UUID]
+    newest: tuple[UUID, ...]
+
+
 class MusicManager:
+    @contextmanager
+    def mutation(self) -> Iterator[None]:
+        """Serialize file allocation, deduplication, and registration by services."""
+        with self._lock:
+            yield
+
     def __init__(self, metadata_path: str | Path, music_folder: str | Path) -> None:
         logger.debug(
             "Initializing MusicManager: metadata_path=%s music_folder=%s",
@@ -48,6 +65,7 @@ class MusicManager:
         self._newest_track_ids: tuple[UUID, ...] | None = None
         try:
             self._load()
+            self._publish_read_state()
         except Exception:
             logger.exception(
                 "MusicManager initialization failed while loading metadata: path=%s",
@@ -286,6 +304,17 @@ class MusicManager:
         )
         data = self._serialize_metadata()
         self._write_metadata(data)
+        self._publish_read_state()
+
+    def _publish_read_state(self) -> None:
+        # Readers never wait behind hashing, imports or durable commits. Publish
+        # only after success; these copies are never mutated by later writers.
+        self._read_state = _LibraryReadState(
+            {key: replace(value) for key, value in self._tracks.items()},
+            {key: self._copy_playlist(value) for key, value in self._playlists.items()},
+            {key: next(iter(ids)) for key, ids in self._source_index.items() if ids},
+            tuple(track.id for track in self._tracks_newest_first()),
+        )
 
     def _serialize_metadata(self) -> bytes:
         parts: list[bytes] = [HEADER.pack(MAGIC, VERSION, len(self._tracks))]
@@ -342,6 +371,7 @@ class MusicManager:
                 self.metadata_path,
             )
             os.replace(temporary_name, self.metadata_path)
+            sync_directory(self.metadata_path.parent)
             logger.info(
                 "Music metadata saved successfully: path=%s byte_count=%d",
                 self.metadata_path,
@@ -584,77 +614,38 @@ class MusicManager:
             return track_count, playlist_count
 
     def list_tracks(self) -> tuple[Track, ...]:
-        logger.debug("Listing tracks")
-        with self._lock:
-            tracks = tuple(replace(track) for track in self._tracks_newest_first())
-        logger.debug("Listed tracks: count=%d", len(tracks))
-        return tracks
+        state = self._read_state
+        return tuple(replace(state.tracks[key]) for key in state.newest)
 
     def counts(self) -> tuple[int, int]:
-        """Return track and playlist counts without copying either collection."""
-        with self._lock:
-            return len(self._tracks), len(self._playlists)
+        state = self._read_state
+        return len(state.tracks), len(state.playlists)
 
     def get_track(self, track_id: UUID | str) -> Track:
-        logger.debug("Getting track: track_id=%s", track_id)
-        with self._lock:
-            track = replace(self._get_track(track_id))
-        logger.debug(
-            "Retrieved track: track_id=%s filename=%s", track.id, track.filename
-        )
-        return track
+        return replace(self._read_state.tracks[_as_uuid(track_id)])
 
     def has_track(self, track_id: UUID | str) -> bool:
-        logger.debug("Checking track existence: track_id=%s", track_id)
         try:
-            normalized = _as_uuid(track_id)
+            return _as_uuid(track_id) in self._read_state.tracks
         except (TypeError, ValueError):
-            result = False
-        else:
-            with self._lock:
-                result = normalized in self._tracks
-        logger.debug("Track existence result: track_id=%s exists=%s", track_id, result)
-        return result
+            return False
 
     def search_tracks(self, query: str) -> tuple[Track, ...]:
-        logger.debug("Searching tracks: query=%r", query)
         needle = query.strip().casefold()
-        if not needle:
-            logger.debug("Search query is empty; returning entire track list")
-            return self.list_tracks()
-        with self._lock:
-            results = tuple(
-                replace(track)
-                for track in self._tracks_newest_first()
-                if needle in track.title.casefold()
-                or needle in track.filename.casefold()
-                or needle in track.source.casefold()
+        return tuple(
+            track
+            for track in self.list_tracks()
+            if not needle
+            or any(
+                needle in value.casefold()
+                for value in (track.title, track.filename, track.source)
             )
-        logger.debug(
-            "Track search completed: query=%r result_count=%d", query, len(results)
         )
-        return results
 
     def find_track_by_source(self, source: str) -> Track | None:
-        logger.debug("Finding track by source: source=%s", source)
-        needle = source_key(source)
-        if not needle:
-            logger.debug(
-                "Source has no identity key; no track can match: source=%r", source
-            )
-            return None
-        with self._lock:
-            matches = self._source_index.get(needle)
-            if matches:
-                track = self._tracks[next(iter(matches))]
-                logger.info(
-                    "Found track by source: source=%s track_id=%s", source, track.id
-                )
-                return replace(track)
-        logger.debug(
-            "No track found for source: source=%s identity_key=%s", source, needle
-        )
-        return None
+        state = self._read_state
+        key = state.sources.get(source_key(source))
+        return replace(state.tracks[key]) if key is not None else None
 
     def find_track_by_content(self, path: str | Path) -> Track | None:
         """Return the track with the same bytes as ``path``, if one exists."""
@@ -798,40 +789,18 @@ class MusicManager:
 
     # -- playlists ---------------------------------------------------
     def list_playlists(self) -> tuple[Playlist, ...]:
-        logger.debug("Listing playlists")
-        with self._lock:
-            playlists = tuple(
-                self._copy_playlist(playlist) for playlist in self._playlists.values()
-            )
-        logger.debug("Listed playlists: count=%d", len(playlists))
-        return playlists
+        return tuple(
+            self._copy_playlist(value) for value in self._read_state.playlists.values()
+        )
 
     def get_playlist(self, playlist_id: UUID | str) -> Playlist:
-        logger.debug("Getting playlist: playlist_id=%s", playlist_id)
-        with self._lock:
-            playlist = self._get_playlist(playlist_id)
-            result = self._copy_playlist(playlist)
-        logger.debug(
-            "Retrieved playlist: playlist_id=%s name=%r track_count=%d",
-            result.id,
-            result.name,
-            len(result.track_ids),
-        )
-        return result
+        return self._copy_playlist(self._read_state.playlists[_as_uuid(playlist_id)])
 
     def has_playlist(self, playlist_id: UUID | str) -> bool:
-        logger.debug("Checking playlist existence: playlist_id=%s", playlist_id)
         try:
-            normalized = _as_uuid(playlist_id)
+            return _as_uuid(playlist_id) in self._read_state.playlists
         except (TypeError, ValueError):
-            result = False
-        else:
-            with self._lock:
-                result = normalized in self._playlists
-        logger.debug(
-            "Playlist existence result: playlist_id=%s exists=%s", playlist_id, result
-        )
-        return result
+            return False
 
     def create_playlist(self, name: str) -> UUID:
         logger.debug("create_playlist entered: name=%r", name)
@@ -913,29 +882,16 @@ class MusicManager:
             return playlist_count
 
     def playlist_tracks(self, playlist_id: UUID | str) -> tuple[Track, ...]:
-        logger.debug("Listing tracks for playlist: playlist_id=%s", playlist_id)
-        with self._lock:
-            playlist = self._get_playlist(playlist_id)
-            tracks = tuple(
-                replace(self._tracks[item])
-                for item in playlist.track_ids
-                if item in self._tracks
-            )
-        logger.debug(
-            "Listed playlist tracks: playlist_id=%s track_count=%d",
-            playlist_id,
-            len(tracks),
+        state = self._read_state
+        playlist = state.playlists[_as_uuid(playlist_id)]
+        return tuple(
+            replace(state.tracks[item])
+            for item in playlist.track_ids
+            if item in state.tracks
         )
-        return tracks
 
     def playlist_track_count(self, playlist_id: UUID | str) -> int:
-        logger.debug("Counting tracks in playlist: playlist_id=%s", playlist_id)
-        with self._lock:
-            count = len(self._get_playlist(playlist_id).track_ids)
-        logger.debug(
-            "Counted playlist tracks: playlist_id=%s track_count=%d", playlist_id, count
-        )
-        return count
+        return len(self._read_state.playlists[_as_uuid(playlist_id)].track_ids)
 
     def add_to_playlist(self, playlist_id: UUID | str, track_id: UUID | str) -> None:
         logger.debug(

@@ -1,21 +1,22 @@
 from __future__ import annotations
 
 import logging
+from functools import partial
 from typing import TYPE_CHECKING
 
 import flet as ft
 
+from musicplayer.application.contracts import Playlist
 from musicplayer.application.downloads import (
-    DuplicateDownloadError,
     extract_download_urls,
 )
 from musicplayer.application.models import SearchResult
-from musicplayer.application.providers import YOUTUBE_PROVIDER_ID, ProviderError
-from musicplayer.core.library.models import Playlist
+from musicplayer.application.providers import YOUTUBE_PROVIDER_ID
 from musicplayer.ui.components.common import (
     _empty_state,
     _format_duration,
 )
+from musicplayer.ui.tasks import page_action, run_io
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +34,7 @@ class SearchPage(_Base):
     SEARCH_PAGE_SIZE = 24
 
     def _initialize_search_page(self) -> None:
+        self._search_local_tracks = {}
         self.search_draft = ""
         self.search_results: list[SearchResult] = []
         self.search_busy = False
@@ -69,14 +71,14 @@ class SearchPage(_Base):
         )
         validation = ft.Text("", color=ft.Colors.ERROR, size=12)
 
-        def start_batch(_: object) -> None:
+        async def start_batch(_: object) -> None:
             urls = extract_download_urls(urls_field.value or "")
             if len(urls) < 2:
                 validation.value = "Paste at least two complete YouTube URLs."
                 self.page.update(validation)
                 return
             try:
-                batch = self.downloads.start_urls(urls)
+                batch = await self.tasks.io(self.downloads.start_urls, urls)
             except (ValueError, OSError, RuntimeError) as error:
                 validation.value = str(error)
                 self.page.update(validation)
@@ -114,9 +116,10 @@ class SearchPage(_Base):
             )
         )
 
-    def _start_url_batch(self, urls: tuple[str, ...]) -> None:
+    @page_action
+    async def _start_url_batch(self, urls: tuple[str, ...]) -> None:
         try:
-            batch = self.downloads.start_urls(urls)
+            batch = await self.tasks.io(self.downloads.start_urls, urls)
         except (ValueError, OSError, RuntimeError) as error:
             self._show_error(str(error))
             return
@@ -155,8 +158,6 @@ class SearchPage(_Base):
         page: int,
         remember: bool,
     ) -> None:
-        if self.search_busy:
-            return
         self.search_busy = True
         self.search_button.disabled = True
         self.search_previous_button.disabled = True
@@ -172,7 +173,14 @@ class SearchPage(_Base):
             self.search_list,
             self.search_pagination,
         )
-        if not self._submit_background(self._perform_search, query, page, remember):
+        if not run_io(
+            self,
+            partial(self._fetch_search, query, page, remember),
+            partial(self._finish_search, page),
+            key="search",
+            replace=True,
+            failed=self._search_failed,
+        ):
             self.search_busy = False
             self.search_button.disabled = False
             self.search_status.value = "Background workers are busy. Retry shortly."
@@ -184,68 +192,58 @@ class SearchPage(_Base):
                 self.search_pagination,
             )
 
-    def _perform_search(
-        self,
-        query: str,
-        page: int,
-        remember: bool,
-    ) -> None:
-        try:
-            offset = (page - 1) * self.SEARCH_PAGE_SIZE
-            fetched = self.providers.search(
-                YOUTUBE_PROVIDER_ID,
-                query,
-                limit=self.SEARCH_PAGE_SIZE + 1,
-                offset=offset,
-            )
-        except ProviderError as error:
-            self.search_results = []
-            self.search_has_next = False
-            self.search_playlist_title = ""
-            self.search_status.value = str(error)
-            self.search_list.controls = [
-                _empty_state(ft.Icons.CLOUD_OFF_ROUNDED, str(error))
-            ]
-        except Exception:
-            self.search_results = []
-            self.search_has_next = False
-            self.search_playlist_title = ""
-            logger.exception("Unexpected provider search failure")
-            self.search_status.value = (
-                "YouTube search failed. Check your connection and try again."
-            )
-            self.search_list.controls = [
-                _empty_state(ft.Icons.ERROR_OUTLINE_ROUNDED, self.search_status.value)
-            ]
-        else:
-            results = fetched[: self.SEARCH_PAGE_SIZE]
-            self.search_results = results
-            self.search_page = page
-            self.search_has_next = len(fetched) > self.SEARCH_PAGE_SIZE
-            self.search_playlist_title = next(
-                (item.playlist_title for item in results if item.playlist_title),
-                "",
-            )
-            if remember:
-                self.store.add_recent("search_history", query, limit=20)
-            self._render_search_results(update=False)
-            self._update_search_navigation()
-        finally:
-            self.search_busy = False
-            self.search_button.disabled = False
-            self._update_search_navigation(update_status=False)
-            try:
-                self.page.update(
-                    self.search_button,
-                    self.search_status,
-                    self.search_list,
-                    self.search_pagination,
-                )
-            except Exception:
-                logger.debug(
-                    "Search result update skipped after window disconnect",
-                    exc_info=True,
-                )
+    def _fetch_search(self, query: str, page: int, remember: bool):
+        offset = (page - 1) * self.SEARCH_PAGE_SIZE
+        fetched = self.providers.search(
+            YOUTUBE_PROVIDER_ID, query, limit=self.SEARCH_PAGE_SIZE + 1, offset=offset
+        )
+        local = {
+            item.url: self.downloads.available_track(item.url)
+            for item in fetched
+            if not item.is_playlist
+        }
+        if remember:
+            self.store.add_recent("search_history", query, limit=20)
+        return fetched, local
+
+    def _finish_search(self, page: int, value) -> None:
+        fetched, self._search_local_tracks = value
+        self.search_results = fetched[: self.SEARCH_PAGE_SIZE]
+        self.search_page = page
+        self.search_has_next = len(fetched) > self.SEARCH_PAGE_SIZE
+        self.search_playlist_title = next(
+            (
+                item.playlist_title
+                for item in self.search_results
+                if item.playlist_title
+            ),
+            "",
+        )
+        self.search_busy = False
+        self.search_button.disabled = False
+        self._render_search_results(update=False)
+        self._update_search_navigation()
+        self.page.update(
+            self.search_button,
+            self.search_status,
+            self.search_list,
+            self.search_pagination,
+        )
+
+    def _search_failed(self, message: str) -> None:
+        self.search_busy = False
+        self.search_button.disabled = False
+        self.search_results = []
+        self.search_has_next = False
+        self.search_status.value = message
+        self.search_list.controls = [_empty_state(ft.Icons.CLOUD_OFF_ROUNDED, message)]
+        self._update_search_navigation(update_status=False)
+        self.page.update(
+            self.search_button,
+            self.search_status,
+            self.search_list,
+            self.search_pagination,
+        )
 
     def _render_search_results(self, *, update: bool = True) -> None:
         if not self.search_results:
@@ -297,23 +295,8 @@ class SearchPage(_Base):
         return self.views._search_result_card(self, result, playlists)
 
     def _available_search_track(self, result: SearchResult):
-        """Resolve the canonical intact local track for a search result."""
-        if result.is_playlist:
-            return None
-        resolver = getattr(getattr(self, "downloads", None), "available_track", None)
-        if resolver is not None:
-            return resolver(result.url)
-        existing = self.manager.find_track_by_source(result.url)
-        if existing is None:
-            return None
-        try:
-            return (
-                existing
-                if self.manager.check_track_integrity(existing.id) is None
-                else None
-            )
-        except (KeyError, OSError, ValueError):
-            return None
+        """Read the result-page cache; rendering must never hash audio files."""
+        return self._search_local_tracks.get(result.url)
 
     def _search_result_menu(
         self,
@@ -388,45 +371,58 @@ class SearchPage(_Base):
         *,
         after: str = "",
         playlist_id: str | None = None,
+        request_generation: int | None = None,
     ) -> None:
-        active_check = getattr(self.downloads, "is_source_active", None)
-        was_active = bool(active_check and active_check(result.url))
-        try:
-            requester = getattr(self.downloads, "request", None)
-            task = (
-                requester(result)
-                if requester is not None
-                else self.downloads.start(result)
+        def prepare():
+            was_active = self.downloads.is_source_active(result.url)
+            task = self.downloads.request(result)
+            existing = (
+                self.downloads.available_track(result.url) if task is None else None
             )
-        except DuplicateDownloadError as error:
-            existing = self._available_search_track(result)
-            if existing and after:
-                self._apply_track_action([str(existing.id)], after, playlist_id)
-            else:
-                self._show_message(str(error))
-        except (ValueError, OSError, RuntimeError) as error:
-            self._show_error(str(error))
-        else:
-            if task is None:
-                existing = self._available_search_track(result)
-                if existing and after:
+            return was_active, task, existing
+
+        def finish(value):
+            was_active, task, existing = value
+            relevant = after != "play" or (
+                request_generation is not None
+                and self.playback.is_current_request(request_generation)
+            )
+            if existing:
+                self._search_local_tracks[result.url] = existing
+                if after and relevant:
                     self._apply_track_action([str(existing.id)], after, playlist_id)
-                elif existing:
+                elif not after:
                     self._show_message("This track is already in your library.")
                 return
-            if after:
+            if task is None:
+                return
+            if after and relevant:
                 self.pending_download_actions[str(task.id)] = (after, playlist_id)
+                if request_generation is not None:
+                    self._download_play_requests[str(task.id)] = request_generation
                 record = self.downloads.get(str(task.id))
                 if record and record.status in {"completed", "failed", "cancelled"}:
                     self._download_changed(record)
-            noun = "playlist" if result.is_playlist else "track"
-            follow_up = {
-                "next": " It will play next when ready.",
-                "queue": " It will join the queue when ready.",
-                "playlist": " It will be added to the playlist when ready.",
-            }.get(after, "")
-            prefix = "Download already in progress for" if was_active else "Downloading"
-            self._show_message(f"{prefix} {noun}.{follow_up}")
+            self._show_message(
+                "Download already in progress." if was_active else "Downloading…"
+            )
+
+        def failed(message):
+            if after == "play" and request_generation is not None:
+                if not self.playback.is_current_request(request_generation):
+                    return
+                self.playback.on_backend_error(message)
+            else:
+                self._show_error(message)
+
+        run_io(
+            self,
+            prepare,
+            finish,
+            key=("download", result.url, after),
+            replace=True,
+            failed=failed,
+        )
 
     def _act_on_search_result(
         self, result: SearchResult, action: str, playlist_id: str | None = None
@@ -459,15 +455,25 @@ class SearchPage(_Base):
             self.playback.add_last_many(available)
             message = "Added to the queue."
         elif action == "playlist" and playlist_id:
-            self.manager.add_tracks_to_playlist(playlist_id, available)
-            playlist = self.manager.get_playlist(playlist_id)
-            message = f"Added to {playlist.name}."
+            run_io(
+                self,
+                lambda: self.manager.add_tracks_to_playlist(playlist_id, available),
+                lambda _: self._show_message("Added to playlist."),
+            )
+            return
         elif action == "favorite":
-            self.library.favorite_tracks(available)
-            message = "Added to favorites."
+            run_io(
+                self,
+                lambda: self.library.favorite_tracks(available),
+                lambda _: self._show_message("Added to favorites."),
+            )
+            return
         elif action == "play":
+            autoplay = self.playback.playing if self.playback.snapshot.loading else True
             self.playback.play_tracks(available)
-            message = "Playing now."
+            if not autoplay:
+                self.playback.toggle()
+            message = "Preparing track…"
         else:
             return
         self._show_message(message)
@@ -512,32 +518,40 @@ class SearchPage(_Base):
         )
 
     def _play_search_result(self, result: SearchResult) -> None:
+        if (
+            self.playback.snapshot.loading
+            and self.playback.external_title == result.title
+        ):
+            return
+        generation = self.playback.begin_pending_track(result.title)
         if not result.is_playlist:
-            existing = self._available_search_track(result)
-            if existing is not None:
-                self.playback.play_track(str(existing.id))
-                return
-            self._download_result(result, after="play")
+            self._download_result(result, after="play", request_generation=generation)
             return
 
-        # A playlist search result is a container, not a single library track.
-        # Keep the useful lightweight preview interaction, and make that intent
-        # explicit in the platform-specific label.
-        provider_id = result.provider_id
-        if self._submit_background(self._resolve_and_play, provider_id, result):
-            self._show_message(f"Previewing “{result.title}”…")
+        def finish(stream):
+            if self.playback.is_current_request(generation):
+                autoplay = self.playback.playing
+                self.playback.play_stream(
+                    stream,
+                    title=result.title,
+                    uploader=result.uploader,
+                    thumbnail=result.thumbnail,
+                )
+                if not autoplay:
+                    self.playback.toggle()
 
-    def _resolve_and_play(self, provider_id: str, result: SearchResult) -> None:
-        try:
-            stream = self.providers.get(provider_id).resolve_stream(result.url)
-            self.playback.play_stream(
-                stream,
-                title=result.title,
-                uploader=result.uploader,
-                thumbnail=result.thumbnail,
-            )
-        except ProviderError as error:
-            self._show_error(str(error))
+        def failed(message):
+            if self.playback.is_current_request(generation):
+                self.playback.on_backend_error(message)
+
+        run_io(
+            self,
+            lambda: self.providers.get(result.provider_id).resolve_stream(result.url),
+            finish,
+            key="preview",
+            replace=True,
+            failed=failed,
+        )
 
     def _search_draft_changed(self, event) -> None:
         self.search_draft = event.control.value or ""

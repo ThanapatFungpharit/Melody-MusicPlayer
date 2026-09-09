@@ -110,6 +110,8 @@ class PlaybackBindings:
                     )
                     favorite = details.favorite
                     self.favorite.disabled = False
+            if playback.snapshot.loading:
+                credit = "Preparing track…"
             self.title.value, self.credit.value = title, credit
             self.art.content = _artwork(thumbnail, int(self.art.width or 48))
             self.favorite.icon = (
@@ -162,7 +164,11 @@ class PlaybackBindings:
             if playback.position_ms
             else "0:00"
         )
-        self.duration.value = _format_duration(playback.duration_ms / 1000)
+        self.duration.value = (
+            "Loading…"
+            if playback.snapshot.loading
+            else _format_duration(playback.duration_ms / 1000)
+        )
 
     def refresh_volume(self) -> None:
         muted = self.app.playback.muted or self.app.playback.volume == 0

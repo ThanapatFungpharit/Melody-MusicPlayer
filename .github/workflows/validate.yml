@@ -1,0 +1,51 @@
+name: Validate
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v9.0.0
+        with:
+          enable-cache: true
+      - run: uv sync --locked --python 3.13 --group build
+      - run: uv run --locked --python 3.13 --group build ruff check src tests tools packages/flet_background_audio/src/flet_background_audio
+      - run: uv run --locked --python 3.13 --group build ruff format --check src tests tools packages/flet_background_audio/src/flet_background_audio
+      - run: uv run --locked --python 3.13 --group build ty check src tests tools
+  tests:
+    name: Tests (${{ matrix.os }}, Python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ['3.12', '3.13']
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v9.0.0
+        with:
+          enable-cache: true
+      - run: uv sync --locked --python ${{ matrix.python }}
+      - name: Unit tests
+        run: uv run --locked --python ${{ matrix.python }} python -m unittest discover -s tests/unit -t . -v
+      - name: Integration tests (offline)
+        run: uv run --locked --python ${{ matrix.python }} python -m unittest discover -s tests/integration -t . -v
+      - name: UI tests (headless)
+        run: uv run --locked --python ${{ matrix.python }} python -m unittest discover -s tests/ui -t . -v
+  build-contracts:
+    name: Packaging contracts and compiled UI smoke tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v9.0.0
+      - run: uv sync --locked --python 3.13 --group build
+      - run: uv run --locked --python 3.13 --group build python -m unittest discover -s tests/packaging -t . -v

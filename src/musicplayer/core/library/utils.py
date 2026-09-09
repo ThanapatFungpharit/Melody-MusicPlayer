@@ -1,8 +1,11 @@
 import hashlib
 import logging
 from pathlib import Path
-from urllib.parse import parse_qs, urlsplit, urlunsplit
 from uuid import UUID
+
+from musicplayer.core.media import source_key
+
+__all__ = ["source_key"]
 
 from .config import U32
 
@@ -54,37 +57,6 @@ def _read_utf8_string(data: bytes, offset: int) -> tuple[str, int]:
 def _pack_utf8_string(value: str) -> bytes:
     encoded = value.encode("utf-8")
     return U32.pack(len(encoded)) + encoded
-
-
-def source_key(source: str) -> str:
-    parsed = urlsplit(source.strip())
-    host = parsed.netloc.casefold().removeprefix("www.")
-    query = parse_qs(parsed.query)
-    if host in {"youtube.com", "m.youtube.com", "music.youtube.com"} and query.get("v"):
-        key = f"youtube:{query['v'][0]}"
-        logger.debug(
-            "Normalized YouTube source identity: source=%s key=%s", source, key
-        )
-        return key
-    if host == "youtu.be":
-        key = f"youtube:{parsed.path.strip('/')}"
-        logger.debug(
-            "Normalized shortened YouTube source identity: source=%s key=%s",
-            source,
-            key,
-        )
-        return key
-    filtered_query = "&".join(
-        f"{name}={value}"
-        for name in sorted(query)
-        if not name.casefold().startswith("utm_")
-        for value in query[name]
-    )
-    key = urlunsplit(
-        (parsed.scheme.casefold(), host, parsed.path.rstrip("/"), filtered_query, "")
-    )
-    logger.debug("Normalized source identity: source=%s key=%s", source, key)
-    return key
 
 
 def _sha256(path: Path) -> str:

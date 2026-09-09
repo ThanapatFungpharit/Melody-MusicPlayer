@@ -1,11 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import subprocess
 import sys
 from pathlib import Path
-
-import flet as ft
 
 from .platform_runtime import (
     MediaBinaryBundle,
@@ -14,6 +13,7 @@ from .platform_runtime import (
     current_platform,
     media_binary_bundle,
 )
+from .yt_dlp_updater import prepare_yt_dlp
 
 logger = logging.getLogger(__name__)
 
@@ -135,7 +135,12 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    # Keep source-tree launches on the same import ordering contract as
+    # packaged launches.  The updater itself never imports yt-dlp.
+    asyncio.run(prepare_yt_dlp())
     prepare_development_media_binaries()
+
+    import flet as ft
 
     from .app import main as app_main
 

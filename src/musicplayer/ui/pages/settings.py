@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -15,6 +16,7 @@ from musicplayer.application.cookie_files import (
 from musicplayer.application.models import AppSettings
 from musicplayer.application.providers import ProviderRegistry
 from musicplayer.ui.components.common import _theme_mode
+from musicplayer.ui.tasks import page_action
 from musicplayer.ui.theme import THEME_PALETTES, card
 
 if TYPE_CHECKING:
@@ -190,9 +192,7 @@ class SettingsPage(_Base):
         self._pending_cookie_file: ValidatedCookieFile | None = None
         self._pending_cookie_name = ""
         self._remove_cookie_requested = False
-        configured_cookie = bool(
-            self.settings.cookie_file and Path(self.settings.cookie_file).is_file()
-        )
+        configured_cookie = bool(self.settings.cookie_file)
         cookie_missing = bool(self.settings.cookie_file) and not configured_cookie
         if configured_cookie:
             cookie_status = f"Using {Path(self.settings.cookie_file).name}"
@@ -509,9 +509,10 @@ class SettingsPage(_Base):
             )
         )
 
-    def _run_data_action(self, action: str) -> None:
+    @page_action
+    async def _run_data_action(self, action: str) -> None:
         try:
-            message = {
+            message = await {
                 "library": self._clear_library,
                 "playlists": self._clear_playlists,
                 "settings": self._reset_settings,
@@ -527,11 +528,11 @@ class SettingsPage(_Base):
         self._refresh_after_data_action(action)
         self._show_message(message)
 
-    def _clear_library(self) -> str:
-        track_count, playlist_count = self.manager.clear_library()
+    async def _clear_library(self) -> str:
+        track_count, playlist_count = await self.tasks.io(self.manager.clear_library)
         self._abandon_playlist_import()
         self.playback.clear_library_state()
-        self.store.clear_library_data()
+        await self.tasks.io(self.store.clear_library_data)
         self.selected_playlist_id = None
         if not track_count and not playlist_count:
             return "The library and playlists are already empty."
@@ -541,8 +542,8 @@ class SettingsPage(_Base):
             f"{'s' if playlist_count != 1 else ''}. Audio files were kept."
         )
 
-    def _clear_playlists(self) -> str:
-        playlist_count = self.manager.clear_playlists()
+    async def _clear_playlists(self) -> str:
+        playlist_count = await self.tasks.io(self.manager.clear_playlists)
         self._abandon_playlist_import()
         self.selected_playlist_id = None
         if not playlist_count:
@@ -552,19 +553,19 @@ class SettingsPage(_Base):
             f"{'s' if playlist_count != 1 else ''}. Library tracks were kept."
         )
 
-    def _reset_settings(self) -> str:
-        already_default = self._restore_default_settings()
+    async def _reset_settings(self) -> str:
+        already_default = await self._restore_default_settings()
         if already_default:
             return "Settings already use their default values."
         return "Settings restored to defaults. Download engine changes apply after restart."
 
-    def _reset_everything(self) -> str:
-        track_count, playlist_count = self.manager.clear_library()
+    async def _reset_everything(self) -> str:
+        track_count, playlist_count = await self.tasks.io(self.manager.clear_library)
         self._abandon_playlist_import()
         self.playback.clear_library_state()
-        self.store.clear_library_data()
+        await self.tasks.io(self.store.clear_library_data)
         self.selected_playlist_id = None
-        already_default = self._restore_default_settings()
+        already_default = await self._restore_default_settings()
         if not track_count and not playlist_count and already_default:
             return "The library, playlists, and settings are already reset."
         return (
@@ -572,22 +573,21 @@ class SettingsPage(_Base):
             "history were kept. Download engine changes apply after restart."
         )
 
-    def _restore_default_settings(self) -> bool:
+    async def _restore_default_settings(self) -> bool:
         defaults = AppSettings()
         already_default = self.settings == defaults
         configured_cookie = self.settings.cookie_file
         managed_cookie = Path(self.data_directory) / COOKIE_FILE_NAME
-        if (
-            configured_cookie
-            and Path(configured_cookie).resolve() == managed_cookie.resolve()
-        ):
-            managed_cookie.unlink(missing_ok=True)
+        if configured_cookie and await self.tasks.io(
+            Path(configured_cookie).resolve
+        ) == await self.tasks.io(managed_cookie.resolve):
+            await self.tasks.io(managed_cookie.unlink, missing_ok=True)
 
         for name in defaults.__dataclass_fields__:
             setattr(self.settings, name, getattr(defaults, name))
-        self.store.save_settings(self.settings)
+        await self.tasks.io(self.store.save_settings, self.settings)
         self.playback.apply_settings(self.settings)
-        self.providers = ProviderRegistry(settings=self.settings)
+        self.providers = await self.tasks.io(ProviderRegistry, settings=self.settings)
         self.page.theme_mode = _theme_mode(self.settings.theme)
         self._pending_cookie_file = None
         self._pending_cookie_name = ""
@@ -712,10 +712,10 @@ class SettingsPage(_Base):
         try:
             content = selected.bytes
             if content is None and selected.path:
-                content = Path(selected.path).read_bytes()
+                content = await self.tasks.io(Path(selected.path).read_bytes)
             if content is None:
                 raise CookieFileError("The selected cookie file could not be read.")
-            validated = validate_cookie_file(bytes(content))
+            validated = await self.tasks.io(validate_cookie_file, bytes(content))
         except (CookieFileError, OSError) as error:
             self._show_error(str(error))
             return
@@ -762,78 +762,77 @@ class SettingsPage(_Base):
         self._reapply_accent()
         self._close_context_panel()
 
-    def _save_settings(self) -> None:
-        folder = Path(self.settings_path.value).expanduser()
-        try:
-            folder.mkdir(parents=True, exist_ok=True)
-        except OSError as error:
-            self._show_error(f"The download folder cannot be used: {error}")
-            return
-        if (
-            folder.resolve() != Path(self.settings.download_directory).resolve()
-            and self.manager.counts()[0]
-        ):
-            self._show_error(
-                "To protect existing files, the music folder can only be changed "
-                "while the library is empty. Remove or migrate your library first."
-            )
-            return
-        cookie_changed = bool(
-            self._pending_cookie_file is not None or self._remove_cookie_requested
-        )
-        cookie_file = self.settings.cookie_file
-        try:
-            if self._pending_cookie_file is not None:
-                destination = Path(self.data_directory) / COOKIE_FILE_NAME
-                cookie_file = str(
-                    install_cookie_file(self._pending_cookie_file, destination)
-                )
-            elif self._remove_cookie_requested:
-                configured = (
-                    Path(self.settings.cookie_file)
-                    if self.settings.cookie_file
-                    else None
-                )
-                managed = Path(self.data_directory) / COOKIE_FILE_NAME
-                if configured and configured.resolve() == managed.resolve():
-                    configured.unlink(missing_ok=True)
-                cookie_file = ""
-        except OSError as error:
-            self._show_error(f"The cookie file could not be saved: {error}")
-            return
+    @page_action
+    async def _save_settings(self) -> None:
+        settings = replace(self.settings)
+        folder_text = self.settings_path.value or ""
+        pending = self._pending_cookie_file
+        remove_cookie = self._remove_cookie_requested
+        settings.audio_format = self.settings_format.value or "mp3"
+        settings.audio_quality = self.settings_quality.value or "best"
+        settings.concurrent_downloads = int(self.settings_concurrency.value or 1)
+        settings.theme = self._theme_draft or self.settings_theme.value or "system"
+        settings.accent_color = self._accent_draft or self._selected_accent
+        settings.resume_session = bool(self.settings_resume.value)
+        settings.notifications = bool(self.settings_notifications.value)
+        old_settings = replace(self.settings)
+        self._show_message("Saving settings…")
 
-        restart_required = any(
-            (
-                str(folder) != self.settings.download_directory,
-                self.settings_format.value != self.settings.audio_format,
-                self.settings_quality.value != self.settings.audio_quality,
-                int(self.settings_concurrency.value or 0)
-                != self.settings.concurrent_downloads,
-                cookie_changed,
-            )
-        )
-        self.settings.download_directory = str(folder)
-        self.settings.audio_format = self.settings_format.value or "mp3"
-        self.settings.audio_quality = self.settings_quality.value or "best"
-        self.settings.concurrent_downloads = int(self.settings_concurrency.value or 0)
-        self.settings.theme = self._theme_draft or self.settings_theme.value or "system"
-        self.settings.accent_color = self._accent_draft or self._selected_accent
-        self.settings.cookie_file = cookie_file
-        self.settings.resume_session = bool(self.settings_resume.value)
-        self.settings.notifications = bool(self.settings_notifications.value)
-        self.store.save_settings(self.settings)
-        self._pending_cookie_file = None
-        self._pending_cookie_name = ""
-        self._remove_cookie_requested = False
-        self._theme_draft = self.settings.theme
-        self._accent_draft = self.settings.accent_color
-        self.providers = ProviderRegistry(settings=self.settings)
-        self.page.theme_mode = _theme_mode(self.settings.theme)
+        def persist():
+            folder = Path(folder_text).expanduser()
+            folder.mkdir(parents=True, exist_ok=True)
+            if (
+                folder.resolve() != Path(old_settings.download_directory).resolve()
+                and self.manager.counts()[0]
+            ):
+                raise ValueError(
+                    "The music folder can only be changed while the library is empty."
+                )
+            settings.download_directory = str(folder)
+            if pending is not None:
+                settings.cookie_file = str(
+                    install_cookie_file(
+                        pending, Path(self.data_directory) / COOKIE_FILE_NAME
+                    )
+                )
+            elif remove_cookie:
+                managed = Path(self.data_directory) / COOKIE_FILE_NAME
+                if (
+                    settings.cookie_file
+                    and Path(settings.cookie_file).resolve() == managed.resolve()
+                ):
+                    managed.unlink(missing_ok=True)
+                settings.cookie_file = ""
+            self.store.save_settings(settings)
+            return ProviderRegistry(settings=settings)
+
+        providers = await self.tasks.io(persist)
+        self.settings = settings
+        self.providers = providers
+        if self._pending_cookie_file is pending:
+            self._pending_cookie_file = None
+            self._pending_cookie_name = ""
+            self._remove_cookie_requested = False
+        self._theme_draft, self._accent_draft = settings.theme, settings.accent_color
+        self.page.theme_mode = _theme_mode(settings.theme)
         self._reapply_accent()
         self.page.update()
+        restart = (
+            any(
+                getattr(settings, key) != getattr(old_settings, key)
+                for key in (
+                    "download_directory",
+                    "audio_format",
+                    "audio_quality",
+                    "concurrent_downloads",
+                    "cookie_file",
+                )
+            )
+            or pending is not None
+        )
         self._show_message(
             "Settings saved. Restart to apply download changes."
-            if restart_required
+            if restart
             else "Settings saved."
         )
 

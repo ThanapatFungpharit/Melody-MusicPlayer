@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from uuid import UUID
 
+from .errors import DownloadFailure
+
 
 class DownloadStatus(str, enum.Enum):
     QUEUED = "queued"
@@ -50,3 +52,4 @@ class DownloadResult:
     status: DownloadStatus
     files: tuple[Path, ...] = ()
     error: str = ""
+    failure: DownloadFailure | None = None

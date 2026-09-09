@@ -5,12 +5,13 @@ from typing import TYPE_CHECKING, Any
 
 import flet as ft
 
-from musicplayer.core.library.models import Playlist, Track
+from musicplayer.application.contracts import Playlist, Track
 from musicplayer.ui.components.common import (
     _empty_state,
     _format_duration,
     _track_title,
 )
+from musicplayer.ui.tasks import page_action
 
 if TYPE_CHECKING:
     from musicplayer.ui._app_protocol import AppProtocol
@@ -90,17 +91,19 @@ class LibraryPage(_Base):
             allow_multiple=True,
         )
         paths = [item.path for item in (files or []) if item.path]
-        if paths and self._submit_background(self._import_local_files, paths):
+        if paths:
+            self._import_local_files(paths)
             self._show_message(
                 f"Importing {len(paths)} local file{'s' if len(paths) != 1 else ''}…"
             )
 
-    def _import_local_files(self, paths: list[str]) -> None:
+    @page_action
+    async def _import_local_files(self, paths: list[str]) -> None:
         imported = 0
         failures: list[str] = []
         for path in paths:
             try:
-                self.library.import_local_file(path)
+                await self.tasks.io(self.library.import_local_file, path)
             except (OSError, ValueError) as error:
                 failures.append(f"{Path(path).name}: {error}")
             else:
@@ -122,8 +125,9 @@ class LibraryPage(_Base):
     ) -> ft.Control:
         return self.views._library_track_row(self, track, index, playlists)
 
-    def _toggle_favorite(self, track_id: str) -> None:
-        self.library.toggle_favorite(track_id)
+    @page_action
+    async def _toggle_favorite(self, track_id: str) -> None:
+        await self.tasks.io(self.library.toggle_favorite, track_id)
         if self.selected_navigation == 2:
             self._refresh_library_list()
         elif self.selected_navigation == 0:
@@ -141,9 +145,9 @@ class LibraryPage(_Base):
             value=_track_title(track), label="Track title", autofocus=True
         )
 
-        def save(_: Any) -> None:
+        async def save(_: Any) -> None:
             try:
-                self.library.rename_track(track.id, field.value)
+                await self.tasks.io(self.library.rename_track, track.id, field.value)
             except ValueError as error:
                 self._show_error(str(error))
                 return
@@ -214,7 +218,7 @@ class LibraryPage(_Base):
         )
 
     def _delete_track_dialog(self, track: Track) -> None:
-        def confirm(_: Any) -> None:
+        async def confirm(_: Any) -> None:
             queue_indexes = [
                 index
                 for index, track_id in enumerate(self.playback.queue.items)
@@ -225,7 +229,7 @@ class LibraryPage(_Base):
             for index in reversed(queue_indexes):
                 self.playback.remove_queue_item(index)
             try:
-                self.library.delete_track_and_file(track.id)
+                await self.tasks.io(self.library.delete_track_and_file, track.id)
             except OSError as error:
                 self._show_error(f"The track could not be deleted completely: {error}")
             self.page.pop_dialog()

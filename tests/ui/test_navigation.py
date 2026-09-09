@@ -8,11 +8,11 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import flet as ft
-from ui_support import TestPage, make_app, walk
 
 from musicplayer.ui.desktop.player import DesktopPlayer
 from musicplayer.ui.mobile.player import MobilePlayer
 from musicplayer.ui.presentation import PresentationKind, presentation_kind
+from tests.ui_support import TestPage, make_app, walk
 
 
 class NavigationTests(unittest.TestCase):

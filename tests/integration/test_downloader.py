@@ -168,9 +168,11 @@ class DownloaderTests(unittest.TestCase):
         ):
             Downloader._remove_files((output,))
 
-    def test_core_downloader_always_uses_bundled_media_tools(self) -> None:
+    def test_core_downloader_accepts_injected_media_tools(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            downloader = Downloader(directory, max_workers=1)
+            downloader = Downloader(
+                directory, max_workers=1, options=_download_options(AppSettings())
+            )
             try:
                 location = Path(downloader._options["ffmpeg_location"])  # ty: ignore[invalid-argument-type]
                 self.assertEqual(location.name, current_architecture())
@@ -395,7 +397,7 @@ class BatchDownloadTests(unittest.TestCase):
             self.assertEqual(record.status, "completed")
             self.assertEqual(record.track_ids, [str(existing_id)])
             self.assertEqual(record.filename, replacement_path.name)
-            self.assertEqual(manager.track_path(existing_id), replacement_path)
+            self.assertTrue(manager.track_path(existing_id).samefile(replacement_path))
             self.assertIsNone(manager.check_track_integrity(existing_id))
             self.assertEqual(
                 manager.playlist_tracks(playlist_id)[0].id,

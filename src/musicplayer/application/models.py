@@ -5,6 +5,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+from musicplayer.core.media import MediaIdentity
 from musicplayer.platform_runtime import default_music_directory
 
 
@@ -91,6 +92,14 @@ class SearchResult:
     entry_count: int = 0
 
     @property
+    def identity(self) -> MediaIdentity | None:
+        if self.is_playlist:
+            return None
+        return MediaIdentity.from_url(self.url) or (
+            MediaIdentity(self.provider_id, self.id) if self.id else None
+        )
+
+    @property
     def is_playlist(self) -> bool:
         return self.kind == "playlist"
 
@@ -110,6 +119,8 @@ class DownloadRecord:
     downloaded_bytes: int = 0
     total_bytes: int = 0
     error: str = ""
+    error_kind: str = ""
+    recovery: str = ""
     created_at: float = field(default_factory=time.time)
     completed_at: float = 0.0
     track_ids: list[str] = field(default_factory=list)

@@ -4,12 +4,15 @@ import json
 import os
 import tempfile
 import threading
+import time
 from collections import deque
-from collections.abc import Iterable
+from collections.abc import Collection, Iterable
 from copy import deepcopy
 from itertools import chain, islice
 from pathlib import Path
 from typing import Any
+
+from musicplayer.core.storage import sync_directory
 
 from .models import AppSettings, DownloadRecord, TrackDetails
 
@@ -100,30 +103,30 @@ class ApplicationStore:
 
     @property
     def settings(self) -> AppSettings:
-        with self._lock:
-            # from_dict constructs a new settings object and only reads the
-            # stored primitives, so copying the mapping first is redundant.
-            return AppSettings.from_dict(self._data["settings"])
+        # from_dict constructs a new settings object and only reads the
+        # stored primitives, so copying the mapping first is redundant.
+        return AppSettings.from_dict(self._data["settings"])
 
     def save_settings(self, settings: AppSettings) -> None:
         with self._lock:
             self._commit_locked({"settings": settings.to_dict()})
 
     def track_details(self, track_id: str) -> TrackDetails:
-        with self._lock:
-            raw = self._data["track_details"].get(str(track_id), {})
-            # TrackDetails owns the values it receives; no mutable value is
-            # shared with the store by this conversion.
-            return TrackDetails.from_dict(raw)
+        raw = self._data["track_details"].get(str(track_id), {})
+        # TrackDetails owns the values it receives; no mutable value is
+        # shared with the store by this conversion.
+        return TrackDetails.from_dict(raw)
+
+    def has_track_details(self, track_id: str) -> bool:
+        return track_id in self._data["track_details"]
 
     def favorite_track_ids(self) -> frozenset[str]:
         """Return favorite identifiers with one lock acquisition and no aliases."""
-        with self._lock:
-            return frozenset(
-                str(track_id)
-                for track_id, details in self._data["track_details"].items()
-                if isinstance(details, dict) and bool(details.get("favorite"))
-            )
+        return frozenset(
+            str(track_id)
+            for track_id, details in self._data["track_details"].items()
+            if isinstance(details, dict) and bool(details.get("favorite"))
+        )
 
     def save_track_details(self, track_id: str, details: TrackDetails) -> None:
         with self._lock:
@@ -155,8 +158,7 @@ class ApplicationStore:
             self._commit_locked(replacements)
 
     def get(self, key: str, default: Any = None) -> Any:
-        with self._lock:
-            return deepcopy(self._data.get(key, default))
+        return deepcopy(self._data.get(key, default))
 
     def set(self, key: str, value: Any) -> None:
         with self._lock:
@@ -194,11 +196,9 @@ class ApplicationStore:
             self._commit_locked(changes, track_details={key: details.to_dict()})
 
     def downloads(self) -> list[DownloadRecord]:
-        with self._lock:
-            return [
-                DownloadRecord.from_dict(item)
-                for item in self._data.get("downloads", [])
-            ]
+        return [
+            DownloadRecord.from_dict(item) for item in self._data.get("downloads", [])
+        ]
 
     def save_downloads(self, records: Iterable[DownloadRecord]) -> None:
         value = [record.to_dict() for record in deque(records, maxlen=250)]
@@ -220,6 +220,20 @@ class ApplicationStore:
             self._commit_locked({}, track_details=changes)
             return len(changes)
 
+    def reconcile_track_references(self, valid_ids: Collection[str]) -> None:
+        """Remove secondary references only after the authoritative library loads."""
+        with self._lock:
+            stale = {
+                key: _MISSING
+                for key in self._data["track_details"]
+                if key not in valid_ids
+            }
+            histories = {
+                key: [item for item in self._data.get(key, []) if item in valid_ids]
+                for key in ("recent_tracks", "playback_history")
+            }
+            self._commit_locked(histories, track_details=stale)
+
     def _recent_items_locked(self, key: str, value: str, *, limit: int) -> list[str]:
         remaining = (item for item in self._data.get(key, []) if item != value)
         return list(islice(chain((value,), remaining), max(0, limit)))
@@ -236,37 +250,62 @@ class ApplicationStore:
         Snapshot only touched entries so updating a track needs no library copy.
         _MISSING represents deletion as well as an absent previous value.
         """
-        updates = [(self._data, changes)]
+        candidate = {**self._data, **changes}
         if track_details:
-            updates.append((self._data["track_details"], track_details))
-        previous = []
-        for target, replacements in updates:
-            for key, value in replacements.items():
-                old_value = target.get(key, _MISSING)
-                if old_value == value:
-                    continue
-                previous.append((target, key, old_value))
+            details = dict(self._data["track_details"])
+            for key, value in track_details.items():
                 if value is _MISSING:
-                    target.pop(key, None)
+                    details.pop(key, None)
                 else:
-                    target[key] = value
-        if not previous:
+                    details[key] = value
+            candidate["track_details"] = details
+        if candidate == self._data:
             return
+        self._pending_data = candidate
         try:
             self._save_locked()
-        except Exception:
-            for target, key, value in reversed(previous):
-                if value is _MISSING:
-                    target.pop(key, None)
-                else:
-                    target[key] = value
-            raise
+        finally:
+            self._pending_data = None
+        self._data = candidate
+
+    def save_playback_updates(
+        self, changes: dict[str, Any], plays: dict[str, int]
+    ) -> None:
+        """Commit coalesced session/volume changes and exact play counts once."""
+        with self._lock:
+            updates = {}
+            if "playback" in changes:
+                updates["playback"] = changes["playback"]
+            if "volume" in changes:
+                updates["settings"] = {**self._data["settings"], **changes["volume"]}
+            details = {}
+            if plays:
+                for key, count in plays.items():
+                    # A deletion that committed before this batch must stay deleted.
+                    if (
+                        not self._data["playback"].get("queue")
+                        and "playback" not in updates
+                    ):
+                        continue
+                    item = TrackDetails.from_dict(
+                        self._data["track_details"].get(key, {})
+                    )
+                    item.play_count += count
+                    item.last_played = time.time()
+                    details[key] = item.to_dict()
+                for name, limit in (("recent_tracks", 20), ("playback_history", 100)):
+                    updates[name] = list(
+                        dict.fromkeys([*reversed(plays), *self._data.get(name, [])])
+                    )[:limit]
+            self._commit_locked(updates, track_details=details)
 
     def _save_locked(self) -> None:
         # Compact JSON materially reduces bytes encoded and flushed for hot
         # state updates. Human readability is provided through typed APIs and
         # documentation rather than whitespace in this private state file.
-        payload = json.dumps(self._data, ensure_ascii=False, separators=(",", ":"))
+        payload = json.dumps(
+            self._pending_data, ensure_ascii=False, separators=(",", ":")
+        )
         fd, temporary_name = tempfile.mkstemp(
             dir=self.path.parent, prefix=".melody-", suffix=".tmp"
         )
@@ -276,6 +315,7 @@ class ApplicationStore:
                 file.flush()
                 os.fsync(file.fileno())
             os.replace(temporary_name, self.path)
+            sync_directory(self.path.parent)
         except Exception:
             try:
                 os.unlink(temporary_name)

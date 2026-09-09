@@ -46,6 +46,7 @@ class AppProtocol(Protocol):
     providers: ProviderRegistry
     downloads: DownloadCoordinator
     workers: LazyBoundedExecutor
+    tasks: Any
     file_picker: ft.FilePicker
     data_directory: Path
 
@@ -53,6 +54,7 @@ class AppProtocol(Protocol):
     selected_navigation: int
     active_panel: str | None
     pending_download_actions: dict[str, tuple[str, str | None]]
+    _download_play_requests: dict[str, int]
     content: ft.Container
     player_bar: ft.Container
     search_query: ft.TextField
