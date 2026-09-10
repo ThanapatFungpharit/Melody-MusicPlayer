@@ -5,8 +5,10 @@ import unittest
 from pathlib import Path
 from threading import Event
 from typing import cast
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from uuid import UUID
+
+from mutagen.id3 import APIC, ID3, PictureType
 
 from musicplayer.application.downloads import (
     DownloadCoordinator,
@@ -127,6 +129,22 @@ class DownloaderTests(unittest.TestCase):
     def test_download_options_are_anonymous_without_an_upload(self) -> None:
         self.assertNotIn("cookiefile", _download_options(AppSettings()))
 
+    def test_every_selectable_format_burns_thumbnail_after_metadata(self) -> None:
+        for audio_format in ("mp3", "m4a", "opus"):
+            with self.subTest(audio_format=audio_format):
+                options = _download_options(AppSettings(audio_format=audio_format))
+                postprocessors = cast(
+                    list[dict[str, object]], options["postprocessors"]
+                )
+
+                self.assertTrue(options["writethumbnail"])
+                self.assertTrue(options["addmetadata"])
+                self.assertEqual(
+                    [processor["key"] for processor in postprocessors],
+                    ["FFmpegExtractAudio", "FFmpegMetadata", "EmbedThumbnail"],
+                )
+                self.assertTrue(postprocessors[-1]["already_have_thumbnail"])
+
     def test_missing_encoder_has_an_actionable_error(self) -> None:
         error = _friendly_download_error(
             "audio conversion failed: Error opening output files: Encoder not found"
@@ -147,6 +165,58 @@ class DownloaderTests(unittest.TestCase):
             self.assertEqual(result.status, DownloadStatus.COMPLETED)  # ty: ignore[unresolved-attribute]
             self.assertEqual(len(result.files), 1)  # ty: ignore[unresolved-attribute]
             self.assertTrue(result.files[0].exists())  # ty: ignore[unresolved-attribute]
+
+    def test_background_download_hands_off_thumbnail_bytes(self) -> None:
+        class ArtworkDownloader(StubDownloader):
+            def _run_yt_dlp(self, job, temporary_directory: str) -> None:
+                tags = ID3()
+                tags.add(
+                    APIC(
+                        mime="image/jpeg",
+                        type=PictureType.COVER_FRONT,
+                        desc="Cover",
+                        data=b"\xff\xd8\xff\xe0embedded cover",
+                    )
+                )
+                tags.save(Path(temporary_directory, "downloaded.mp3"))
+                Path(temporary_directory, "cover.jpg").write_bytes(
+                    b"\xff\xd8\xff\xe0downloaded sidecar"
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            downloader = ArtworkDownloader(directory, max_workers=1)
+            task = downloader.start("https://example.test/audio")
+            job = downloader._jobs[task.id]
+            job.future.result(timeout=3)  # ty: ignore[unresolved-attribute]
+            result = downloader.result(task)
+            downloader.shutdown()
+
+            assert result is not None
+            self.assertEqual(result.artwork, b"\xff\xd8\xff\xe0embedded cover")
+            self.assertEqual(list(Path(directory).glob("*.jpg")), [])
+
+    def test_download_fails_if_thumbnail_was_not_burned_into_media(self) -> None:
+        class MissingEmbeddedArtworkDownloader(StubDownloader):
+            def _run_yt_dlp(self, job, temporary_directory: str) -> None:
+                super()._run_yt_dlp(job, temporary_directory)
+                Path(temporary_directory, "cover.jpg").write_bytes(
+                    b"\xff\xd8\xff\xe0downloaded sidecar"
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            downloader = MissingEmbeddedArtworkDownloader(directory, max_workers=1)
+            task = downloader.start("https://example.test/audio")
+            job = downloader._jobs[task.id]
+            job.future.result(timeout=3)  # ty: ignore[unresolved-attribute]
+            result = downloader.result(task)
+            downloader.shutdown()
+
+            assert result is not None
+            self.assertEqual(result.status, DownloadStatus.FAILED)
+            self.assertIn("not embedded in the media file", result.error)
+            assert result.failure is not None
+            self.assertEqual(result.failure.kind.value, "postprocessing")
+            self.assertIn("Cover artwork", result.failure.message)
 
     def test_empty_audio_output_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -242,6 +312,45 @@ class DownloadImportTests(unittest.TestCase):
         self.assertEqual(details.duration, 123.5)
         self.assertEqual(self.coordinator.active_count(), 0)
         self.assertEqual(self.store.downloads()[0].track_ids, [str(track.id)])
+
+    def test_completion_caches_thumbnail_without_rewriting_its_source_url(
+        self,
+    ) -> None:
+        path = self.music / "downloaded.mp3"
+        path.write_bytes(b"new audio")
+        thumbnail = "https://example.test/artwork.jpg"
+        cache = Mock()
+        cache.store_bytes.return_value = True
+        self.coordinator.thumbnails = cache
+        self.coordinator._handle_progress(
+            DownloadProgress(
+                self.task,
+                self.url,
+                DownloadStatus.PROCESSING,
+                thumbnail=thumbnail,
+            ),
+            self.metadata,
+        )
+
+        self.coordinator._handle_complete(
+            DownloadResult(
+                self.task,
+                self.url,
+                DownloadStatus.COMPLETED,
+                (path,),
+                artwork=b"\xff\xd8\xff\xe0cached cover",
+            ),
+            self.metadata,
+        )
+
+        cache.store_bytes.assert_called_once_with(
+            thumbnail, b"\xff\xd8\xff\xe0cached cover"
+        )
+        record = self.coordinator.list()[0]
+        self.assertEqual(record.thumbnail, thumbnail)
+        self.assertEqual(
+            self.store.track_details(record.track_ids[0]).thumbnail, thumbnail
+        )
 
     def test_source_match_takes_priority_over_content_match(self) -> None:
         source_path = self.music / "source.mp3"
@@ -698,6 +807,39 @@ class BatchDownloadTests(unittest.TestCase):
                 with self.assertRaisesRegex(DuplicateDownloadError, "downloading"):
                     coordinator.start_url("https://www.youtube.com/watch?v=video-id")
 
+        downloader.return_value.start.assert_called_once()
+
+    def test_request_ownership_is_atomic_with_active_source_deduplication(
+        self,
+    ) -> None:
+        store = _DownloadStore()
+
+        def start(url, *, on_progress, on_complete):
+            task = DownloadTask(UUID(int=1))
+            on_progress(DownloadProgress(task, url, DownloadStatus.QUEUED))
+            return task
+
+        result = SearchResult(
+            id="video-id",
+            title="Song",
+            uploader="Uploader",
+            duration=1,
+            thumbnail="",
+            url="https://youtu.be/video-id",
+            source="YouTube",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            settings = AppSettings(download_directory=directory)
+            with patch("musicplayer.application.downloads.Downloader") as downloader:
+                downloader.return_value.start.side_effect = start
+                coordinator = DownloadCoordinator(_Manager(), store, settings)  # ty: ignore[invalid-argument-type]
+
+                first, first_owned = coordinator.request_with_ownership(result)
+                joined, joined_owned = coordinator.request_with_ownership(result)
+
+        self.assertEqual(first, joined)
+        self.assertTrue(first_owned)
+        self.assertFalse(joined_owned)
         downloader.return_value.start.assert_called_once()
 
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import re
+import stat
 import threading
 import time
 from collections.abc import Callable, Iterable
@@ -25,6 +26,7 @@ from musicplayer.runtime_environment import public_error_message
 from .models import AppSettings, DownloadRecord, SearchResult, TrackDetails
 from .providers import is_youtube_url
 from .store import ApplicationStore
+from .thumbnails import ThumbnailCache
 from .yt_dlp_settings import yt_dlp_options
 
 logger = logging.getLogger(__name__)
@@ -76,16 +78,17 @@ class DownloadCoordinator:
         settings: AppSettings,
         *,
         on_change: Callable[[DownloadRecord], None] | None = None,
+        thumbnails: ThumbnailCache | None = None,
     ) -> None:
         self.manager = manager
         self.store = store
         self.settings = settings
         self.on_change = on_change
+        self.thumbnails = thumbnails
         self._lock = threading.RLock()
         self._last_progress_notify = 0.0
         self._last_progress_persist = 0.0
         self._records = {record.id: record for record in store.downloads()}
-        self._ordered_records: tuple[DownloadRecord, ...] | None = None
         self._active_records_by_source: dict[str, str] = {}
         self._recover_handoffs()
         recovered = False
@@ -94,8 +97,7 @@ class DownloadCoordinator:
                 record.status == "completed"
                 and record.track_ids
                 and any(
-                    not self.manager.has_track(track_id)
-                    or not self.manager.track_path(track_id).is_file()
+                    not self._track_file_available(track_id)
                     for track_id in record.track_ids
                 )
             ):
@@ -177,6 +179,18 @@ class DownloadCoordinator:
         An existing active task is returned so callers can attach a follow-up
         action without creating another download or staging another media file.
         """
+        task, _ = self.request_with_ownership(result)
+        return task
+
+    def request_with_ownership(
+        self, result: SearchResult
+    ) -> tuple[DownloadTask | None, bool]:
+        """Request media and report whether this call created the returned task.
+
+        The ownership flag is decided under the same coordinator lock as active
+        source deduplication. Callers can therefore cancel work they created
+        without racing and cancelling a task that another action already owned.
+        """
         if not result.url:
             raise ValueError("This result does not provide a downloadable URL.")
         metadata = {
@@ -188,7 +202,7 @@ class DownloadCoordinator:
             "kind": result.kind,
             "duration": result.duration,
         }
-        return self._request(metadata)
+        return self._request_with_ownership(metadata)
 
     def start(self, result: SearchResult) -> DownloadTask:
         if not result.url:
@@ -271,18 +285,24 @@ class DownloadCoordinator:
         return DownloadBatch(batch_id, tuple(tasks), len(unique_sources))
 
     def _request(self, metadata: dict[str, object]) -> DownloadTask | None:
+        task, _ = self._request_with_ownership(metadata)
+        return task
+
+    def _request_with_ownership(
+        self, metadata: dict[str, object]
+    ) -> tuple[DownloadTask | None, bool]:
         url = str(metadata.get("url") or "")
         if not url:
             raise ValueError("A YouTube URL is required.")
         if not is_youtube_url(url):
             raise ValueError("Only YouTube URLs are supported.")
         if metadata.get("kind") != "playlist" and self.available_track(url):
-            return None
+            return None, False
         with self._lock:
             active = self._active_record_for_source_locked(url)
             if active is not None:
-                return DownloadTask(_uuid(active.id))
-            return self._start(metadata)
+                return DownloadTask(_uuid(active.id)), False
+            return self._start(metadata), True
 
     def _start(self, metadata: dict[str, object]) -> DownloadTask:
         url = str(metadata["url"])
@@ -337,7 +357,6 @@ class DownloadCoordinator:
                 for key, value in self._records.items()
                 if value.status in self.ACTIVE_STATUSES
             }
-            self._ordered_records = None
             self._persist()
 
     def shutdown(self, *, wait: bool = False) -> None:
@@ -402,6 +421,7 @@ class DownloadCoordinator:
             imported = []
             stored_paths: list[Path] = []
             try:
+                self._cache_thumbnail(thumbnail, result.artwork)
                 for path in result.files:
                     track_id, stored_path = self._import_downloaded_file(
                         path, metadata, uploader=uploader, thumbnail=thumbnail
@@ -446,6 +466,15 @@ class DownloadCoordinator:
                     "Could not acknowledge completed download receipt", exc_info=True
                 )
         self._notify(record)
+
+    def _cache_thumbnail(self, url: str, artwork: bytes) -> None:
+        """Cache artwork verified in the media file; the file remains canonical."""
+        if self.thumbnails is None or not url or not artwork:
+            return
+        try:
+            self.thumbnails.store_bytes(url, artwork)
+        except Exception:
+            logger.warning("Could not cache downloaded thumbnail", exc_info=True)
 
     def _recover_handoffs(self) -> None:
         """Finish a download whose bytes survived but registration was interrupted."""
@@ -562,7 +591,6 @@ class DownloadCoordinator:
         if record is None:
             record = _record_from_metadata(key, metadata)
             self._records[key] = record
-            self._ordered_records = None
             self._prune_records_locked()
         identity = source_key(record.url)
         if identity and record.status in self.ACTIVE_STATUSES:
@@ -578,7 +606,6 @@ class DownloadCoordinator:
         record.completed_at = time.time()
         with self._lock:
             self._records[record.id] = record
-            self._ordered_records = None
             self._prune_records_locked()
             self._persist()
         self._notify(record)
@@ -602,7 +629,6 @@ class DownloadCoordinator:
         )
         for record in finished[:excess]:
             self._records.pop(record.id, None)
-        self._ordered_records = None
 
     def _notify(self, record: DownloadRecord) -> None:
         if self.on_change:
@@ -616,6 +642,15 @@ class DownloadCoordinator:
         identity = source_key(url)
         record_id = self._active_records_by_source.get(identity)
         return self._records.get(record_id) if record_id is not None else None
+
+    def _track_file_available(self, track_id: str) -> bool:
+        """Use cheap startup availability; full hashes remain explicit checks."""
+        try:
+            path = self.manager.track_path(track_id)
+            status = path.stat()
+            return status.st_size > 0 and stat.S_ISREG(status.st_mode)
+        except (OSError, KeyError, ValueError):
+            return False
 
 
 def _url_metadata(url: str, *, title: str) -> dict[str, object]:
@@ -669,9 +704,11 @@ def _download_options(settings: AppSettings) -> dict[str, object]:
                 "preferredcodec": settings.audio_format,
                 "preferredquality": quality,
             },
-            {"key": "EmbedThumbnail"},
             {"key": "FFmpegMetadata"},
+            {"key": "EmbedThumbnail", "already_have_thumbnail": True},
         ],
+        "writethumbnail": True,
+        "addmetadata": True,
         **yt_dlp_options(settings),
     }
 

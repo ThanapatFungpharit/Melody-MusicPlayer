@@ -101,11 +101,12 @@ def more(app, title: str, items: list[ft.PopupMenuItem]) -> ft.IconButton:
 def track_row(
     title: str,
     credit: str,
-    artwork: str,
+    artwork: str | bytes,
     play,
     trailing: ft.Control,
     *,
     selected: bool = False,
+    cache=None,
 ) -> ft.Control:
     return ft.Container(
         ft.Row(
@@ -113,7 +114,7 @@ def track_row(
                 ft.Container(
                     ft.Row(
                         [
-                            _artwork(artwork, 48),
+                            _artwork(artwork, 48, cache=cache),
                             ft.Column(
                                 [
                                     ft.Text(

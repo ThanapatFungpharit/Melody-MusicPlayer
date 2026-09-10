@@ -163,7 +163,11 @@ def _library_track_row(
         ft.Row(
             [
                 *leading,
-                _artwork(details.thumbnail, 44),
+                _artwork(
+                    details.thumbnail,
+                    44,
+                    cache=getattr(app, "thumbnails", None),
+                ),
                 ft.Column(
                     [
                         ft.Text(

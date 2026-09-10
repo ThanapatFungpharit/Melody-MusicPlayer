@@ -54,7 +54,9 @@ arbitrary computed dynamic import; add such imports only with focused tests.
 | Settings, enriched track details, history, session queue | `ApplicationStore` | Writes commit atomically; failure restores in-memory values |
 | Worker execution, cancellation, staged download files | `Downloader` | Coordinator acknowledges successful handoff |
 | Download reuse, registration, retry, durable operation history | `DownloadCoordinator` | Core does not know about the library |
-| Runtime yt-dlp selection | Startup updater and its `UpdateResult` | Providers and workers import yt-dlp only after selection |
+| Embedded cover artwork | Downloaded media container | Downloader verifies the final tag before committing the file |
+| Offline UI artwork keyed by remote URL | `ThumbnailCache` | Derived only from verified embedded bytes; UI and system media resolve cached forms |
+| Runtime yt-dlp updates | Explicit updater and its `UpdateResult` | Normal launch and providers use the immutable bundled dependency |
 
 ### Playback and concurrency
 
@@ -65,25 +67,45 @@ proof that the device has emitted sound. Consumers needing a consistent view
 can read the immutable `PlaybackSnapshot`.
 
 Commands, queue mutations, and native callbacks share the controller's reentrant
-lock. Background reads use the same lock and a generation counter. Switching a
-source or handling an error invalidates an earlier read. Events received while
-replacement bytes are loading cannot overwrite the new request. The adapter
-rejects events from obsolete native services and handles completion once per
-service generation. Callbacks must enqueue UI work or return promptly; do not
-wait for another thread that needs the controller lock.
+lock. Background source resolution and one predicted-next preload use the same
+lock with independent generation counters. Switching a source, editing the
+queue, or handling an error cancels or invalidates obsolete work. The adapter
+mounts one native service for the page lifetime; it prepares a candidate decoder
+beside the active one and swaps only after readiness. Events from the retiring
+decoder are ignored during both Python and native preparation, and completion is
+handled once per generation. Transport RPCs have their own lock, so Pause remains
+responsive while a candidate source is preparing. Callbacks must enqueue UI work
+or return promptly; do not wait for another thread that needs the controller
+lock.
 
 The backend owns transport mechanics, RPC ordering, and native session updates;
 it must not advance the queue or maintain a competing application queue.
 System media controls call the same controller commands as the visible UI.
 Returning from background queries the native player and reconciles observations.
-Suspending a page is not a request to stop playback.
+Suspending a page is not a request to stop playback. Pause preserves the active
+media session and exposes Play. On Android, a non-empty resumable queue keeps
+the foreground media service attached while paused; only explicit Stop discards
+the decoder, releases keep-alive resources, and deactivates system controls.
 
-Full Android process death or Flet page/service recreation is a distinct case.
-The current bridge does not claim durable restoration of a native player's
-identity after the Python process is recreated. Implementing that requires a
-native session identity/reattachment protocol and device tests, not another
-Python `playing` flag. iOS background and lock-screen behavior also requires
-device verification. The headless suite cannot certify either lifecycle.
+Android release builds patch the generated launcher activity to `singleTask`
+and disable document launching. Launcher and notification intents therefore
+route to the existing task rather than constructing a second Python/controller
+owner. Within that process, activation is idempotent, the native session stays
+mounted across activity detach/reattach, and foreground resume reconciles the
+player timeline. Full Android process death still destroys in-memory decoder
+identity; the persisted queue can be restored, but automatic continuation is not
+claimed. iOS background and lock-screen behavior and Android lifecycle behavior
+still require physical-device release testing; the headless suite cannot certify
+operating-system policy.
+
+Shuffle is a one-time in-place reorder of the playback queue. Enabling it keeps
+the current track fixed and reorders only upcoming rows; starting a collection
+with Shuffle reorders the whole collection before selecting its first row.
+Next, Previous, repeat, preload prediction, persistence, and the queue UI then
+all follow that same visible order without making another random choice.
+Playlist order is separately authoritative in `MusicManager`: desktop drag/drop
+and mobile move actions persist a strict complete order without replacing or
+restarting the active playback queue.
 
 Downloads have a separate bounded worker pool. Coordinator reservations use
 canonical source keys under its lock; requests for one source share active
@@ -91,6 +113,23 @@ work. Library file allocation, duplicate lookup, and registration are serialized
 through `MusicManager.mutation()`, including local imports and download imports.
 ApplicationStore serializes each JSON transaction. A data directory is intended
 for one application writer; the library is not a multiprocess database.
+
+Thumbnail files written by yt-dlp stay in staging while metadata is written and
+the cover is burned into the final audio container. Embedding is the last media
+postprocessor. Before promotion, the worker reads the artwork back from every
+completed media file; advertised or retained artwork without a readable
+embedded cover is a terminal post-processing failure. Mutagen is a direct dependency so this works
+for all selectable MP3, M4A, and Opus formats rather than relying on an optional
+yt-dlp extra. Only verified embedded bytes are copied into the URL-keyed UI
+cache. That derived cache is committed atomically, and a cache failure does not
+invalidate the authoritative media file. Flet receives cached bytes directly
+and native media sessions receive a file URI, avoiding connectivity probes and
+repeated container parsing while offline.
+
+Startup loads only durable state needed for the first view. It does not run the
+network updater, fetch development media tools, reconcile unregistered files, or
+hash every completed download. Cheap stat-based availability filters the restored
+queue and history; full content integrity remains an explicit operation.
 
 ## Track identity and files
 

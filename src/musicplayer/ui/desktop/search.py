@@ -174,7 +174,12 @@ def _search_result_row(
     return card(
         ft.Row(
             [
-                _artwork(result.thumbnail, 52, playlist=result.is_playlist),
+                _artwork(
+                    result.thumbnail,
+                    52,
+                    playlist=result.is_playlist,
+                    cache=getattr(app, "thumbnails", None),
+                ),
                 ft.Column(
                     [
                         ft.Text(
@@ -218,7 +223,12 @@ def _search_result_card(
         card(
             ft.Column(
                 [
-                    _artwork(result.thumbnail, art_size, playlist=result.is_playlist),
+                    _artwork(
+                        result.thumbnail,
+                        art_size,
+                        playlist=result.is_playlist,
+                        cache=getattr(app, "thumbnails", None),
+                    ),
                     ft.Text(
                         result.title,
                         weight=ft.FontWeight.BOLD,

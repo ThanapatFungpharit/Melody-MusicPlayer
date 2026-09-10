@@ -18,6 +18,7 @@ from uuid import UUID, uuid4
 from musicplayer.core.concurrency import LazyBoundedExecutor
 from musicplayer.core.storage import sync_directory
 
+from .artwork import read_embedded_artwork
 from .config import OPTS
 from .errors import classify_download_error
 from .models import DownloadProgress, DownloadResult, DownloadStatus, DownloadTask
@@ -26,6 +27,8 @@ from .receipts import file_digest, receipt_path, write_receipt
 logger = logging.getLogger(__name__)
 ProgressCallback = Callable[[DownloadProgress], None]
 CompletionCallback = Callable[[DownloadResult], None]
+_THUMBNAIL_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"})
+_MAX_THUMBNAIL_BYTES = 8 * 1024 * 1024
 
 
 class _DownloadCancelled(Exception):
@@ -149,10 +152,11 @@ class Downloader:
         with self._lock:
             job = self._jobs[task_id]
         files: tuple[Path, ...] = ()
+        artwork = b""
         try:
             self._raise_if_cancelled(job)
             self._update(job, status=DownloadStatus.DOWNLOADING)
-            files = self._download_one(job)
+            files, artwork = self._download_one(job)
             self._raise_if_cancelled(job)
         except _DownloadCancelled:
             self._remove_files(files)
@@ -162,24 +166,37 @@ class Downloader:
             self._remove_files(files)
             self._finish(job, DownloadStatus.FAILED, error=str(error), exception=error)
         else:
-            self._finish(job, DownloadStatus.COMPLETED, files=files)
+            self._finish(job, DownloadStatus.COMPLETED, files=files, artwork=artwork)
 
-    def _download_one(self, job: _Job) -> tuple[Path, ...]:
+    def _download_one(self, job: _Job) -> tuple[tuple[Path, ...], bytes]:
         with tempfile.TemporaryDirectory(
             dir=self._output_dir, prefix=".melody-download-"
         ) as temporary_directory:
             temporary_path = Path(temporary_directory)
             self._run_yt_dlp(job, temporary_directory)
             self._raise_if_cancelled(job)
+            downloaded_artwork = self._read_downloaded_thumbnail(temporary_path)
+            artwork = self._verified_embedded_artwork(
+                temporary_path,
+                artwork_expected=bool(
+                    downloaded_artwork or job.progress.thumbnail.strip()
+                ),
+            )
             files = self._move_downloaded_files(job, temporary_path)
         if not files:
             raise RuntimeError("The download did not produce an audio file")
-        return tuple(files)
+        return tuple(files), artwork
 
     def _run_yt_dlp(self, job: _Job, temporary_directory: str) -> None:
-        # Imported only after the startup updater has selected and activated a
-        # wheel.  Keeping this out of module import time protects all entry
-        # points, including source-tree launches and test discovery.
+        # Development media-tool setup is registered at launch but starts only
+        # here, at the first feature that actually requires FFmpeg. Packaged
+        # builds have no registered operation and continue immediately.
+        from musicplayer.core.runtime_gate import (
+            MEDIA_BINARY_PREPARATION,
+            wait_for_runtime_preparation,
+        )
+
+        wait_for_runtime_preparation(key=MEDIA_BINARY_PREPARATION)
         from yt_dlp import YoutubeDL
 
         options: dict[str, Any] = {
@@ -189,6 +206,59 @@ class Downloader:
         }
         with YoutubeDL(options) as downloader:
             downloader.download([job.progress.url])
+
+    @staticmethod
+    def _read_downloaded_thumbnail(temporary_directory: Path) -> bytes:
+        """Read the sidecar yt-dlp retained after embedding for verification."""
+        candidates: list[tuple[int, Path]] = []
+        try:
+            for path in temporary_directory.iterdir():
+                if path.suffix.casefold() not in _THUMBNAIL_EXTENSIONS:
+                    continue
+                status = path.stat()
+                if (
+                    stat.S_ISREG(status.st_mode)
+                    and 0 < status.st_size <= _MAX_THUMBNAIL_BYTES
+                ):
+                    candidates.append((status.st_size, path))
+        except OSError:
+            logger.debug("Could not inspect downloaded thumbnails", exc_info=True)
+            return b""
+        if not candidates:
+            return b""
+        try:
+            # Prefer the largest retained thumbnail when a provider supplied
+            # several renditions; all candidates remain staging-owned.
+            return max(candidates, key=lambda item: item[0])[1].read_bytes()
+        except OSError:
+            logger.debug("Could not read downloaded thumbnail", exc_info=True)
+            return b""
+
+    def _verified_embedded_artwork(
+        self, temporary_directory: Path, *, artwork_expected: bool
+    ) -> bytes:
+        """Read back burned cover art before any completed media is committed."""
+        embedded: list[bytes] = []
+        missing: list[str] = []
+        try:
+            candidates = tuple(temporary_directory.iterdir())
+        except OSError:
+            candidates = ()
+        for path in candidates:
+            if path.suffix.casefold() not in self._audio_extensions:
+                continue
+            artwork = read_embedded_artwork(path)
+            if artwork:
+                embedded.append(artwork)
+            elif artwork_expected:
+                missing.append(path.name)
+        if missing:
+            names = ", ".join(sorted(missing))
+            raise RuntimeError(
+                "Thumbnail artwork was available, but it was not embedded "
+                f"in the media file: {names}"
+            )
+        return max(embedded, key=len, default=b"")
 
     def _move_downloaded_files(
         self, job: _Job, temporary_directory: Path
@@ -290,6 +360,7 @@ class Downloader:
         files: tuple[Path, ...] = (),
         error: str = "",
         exception: Exception | None = None,
+        artwork: bytes = b"",
     ) -> None:
         with self._lock:
             if job.result is not None:
@@ -326,6 +397,7 @@ class Downloader:
                 classify_download_error(exception or error)
                 if status is DownloadStatus.FAILED
                 else None,
+                artwork if status is DownloadStatus.COMPLETED else b"",
             )
             self._terminal_jobs.append(job.task.id)
             self._prune_terminal_jobs_locked()

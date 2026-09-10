@@ -45,7 +45,12 @@ class DownloadProgress:
 
 @dataclass(frozen=True)
 class DownloadResult:
-    """The terminal outcome of one download."""
+    """The terminal outcome of one download.
+
+    ``artwork`` is read back from the completed media container. It is exposed
+    so presentation layers can build disposable caches without making those
+    caches the authoritative copy of the cover.
+    """
 
     task: DownloadTask
     url: str
@@ -53,3 +58,4 @@ class DownloadResult:
     files: tuple[Path, ...] = ()
     error: str = ""
     failure: DownloadFailure | None = None
+    artwork: bytes = b""

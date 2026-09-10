@@ -6,6 +6,7 @@ import argparse
 import os
 import shutil
 import sys
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +24,7 @@ ANDROID_ABIS = {
     "arm": "armeabi-v7a",
     "x86_64": "x86_64",
 }
+ANDROID_XML_NAMESPACE = "http://schemas.android.com/apk/res/android"
 
 
 def stage_android_native_libraries(
@@ -48,6 +50,45 @@ def stage_android_native_libraries(
         shutil.copy2(source / "ffprobe", destination / "libffprobe.so")
 
 
+def configure_single_task_activity(flutter_dir: Path) -> None:
+    """Make launcher and notification intents reuse Melody's one activity.
+
+    Flet's standard Flutter template uses ``singleTop``. That permits another
+    MainActivity whenever the existing activity is not currently at the top of
+    its task, which can create a second Flet page, playback controller, and
+    media-session bridge. ``singleTask`` routes those intents to the existing
+    activity via ``onNewIntent``; disabling document launches closes the other
+    Android route to parallel task instances.
+    """
+    manifest = flutter_dir / "android" / "app" / "src" / "main" / "AndroidManifest.xml"
+    tree = ET.parse(manifest)
+    root = tree.getroot()
+    android_name = f"{{{ANDROID_XML_NAMESPACE}}}name"
+    launcher = None
+    for activity in root.findall("./application/activity"):
+        for intent_filter in activity.findall("intent-filter"):
+            actions = {
+                item.get(android_name) for item in intent_filter.findall("action")
+            }
+            categories = {
+                item.get(android_name) for item in intent_filter.findall("category")
+            }
+            if (
+                "android.intent.action.MAIN" in actions
+                and "android.intent.category.LAUNCHER" in categories
+            ):
+                launcher = activity
+                break
+        if launcher is not None:
+            break
+    if launcher is None:
+        raise RuntimeError("Generated Android manifest has no launcher activity")
+    launcher.set(f"{{{ANDROID_XML_NAMESPACE}}}launchMode", "singleTask")
+    launcher.set(f"{{{ANDROID_XML_NAMESPACE}}}documentLaunchMode", "never")
+    ET.register_namespace("android", ANDROID_XML_NAMESPACE)
+    tree.write(manifest, encoding="utf-8", xml_declaration=True)
+
+
 def _run_flet_build(
     target: str, architectures: list[str], flet_arguments: list[str]
 ) -> None:
@@ -61,6 +102,7 @@ def _run_flet_build(
 
     def run_flutter(self: Any) -> None:
         stage_android_native_libraries(self.flutter_dir, architectures)
+        configure_single_task_activity(self.flutter_dir)
         original_run_flutter(self)
 
     Command.run_flutter = run_flutter

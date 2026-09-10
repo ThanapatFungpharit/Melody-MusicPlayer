@@ -8,10 +8,14 @@ OPTS = {
             "preferredquality": "0",
         },
         {
-            "key": "EmbedThumbnail",
+            "key": "FFmpegMetadata",
         },
         {
-            "key": "FFmpegMetadata",
+            "key": "EmbedThumbnail",
+            # Keep the sidecar in staging after yt-dlp burns it into the media.
+            # The downloader verifies the embedded tag, then derives the UI
+            # cache from that tag rather than treating the cache as canonical.
+            "already_have_thumbnail": True,
         },
     ],
     "writethumbnail": True,

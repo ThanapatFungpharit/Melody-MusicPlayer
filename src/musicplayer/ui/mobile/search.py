@@ -107,6 +107,7 @@ def _search_result_row(app, result, playlists) -> ft.Control:
             title,
             app._search_result_menu(result, playlists, include_primary_actions=True),
         ),
+        cache=getattr(app, "thumbnails", None),
     )
 
 

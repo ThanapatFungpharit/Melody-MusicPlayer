@@ -16,6 +16,7 @@ from musicplayer.application.playback import PlaybackController
 from musicplayer.application.playback_persistence import PlaybackPersistence
 from musicplayer.application.providers import ProviderRegistry
 from musicplayer.application.store import ApplicationStore
+from musicplayer.application.thumbnails import ThumbnailCache
 from musicplayer.core.concurrency import LazyBoundedExecutor, WorkerQueueFull
 from musicplayer.core.library import MusicManager
 from musicplayer.platform_runtime import (
@@ -131,8 +132,8 @@ class MusicPlayerApp(
         self.settings = resources.store.settings
         self.manager = resources.manager
         self.library = resources.library
-        self.reconciliation = resources.reconciliation
         self.providers = resources.providers
+        self.thumbnails = resources.thumbnails
         # Search, stream resolution, and imports share a bounded I/O pool that
         # exists only while at least one background operation is in flight.
         self.workers = LazyBoundedExecutor(
@@ -225,6 +226,7 @@ class MusicPlayerApp(
         if event.state not in (ft.AppLifecycleState.SHOW, ft.AppLifecycleState.RESUME):
             return
         self.backend.refresh_state()
+        self.backend.invalidate_media_session()
         # Refresh the session immediately with the current controller state;
         # the native position query above will publish a precise correction as
         # soon as it completes.
@@ -232,7 +234,7 @@ class MusicPlayerApp(
 
     def _playback_changed(self, change: str = "state") -> None:
         if change != "volume":
-            self._sync_system_media(refresh_metadata=change != "progress")
+            self._sync_system_media(refresh_metadata=change == "track")
         if change == "progress":
             self._refresh_player_progress()
             return
@@ -253,7 +255,7 @@ class MusicPlayerApp(
         ):
             self._last_announced_track = current
             self._show_message(f"Now playing: {self.player.title.value}")
-        if self.active_panel == "queue":
+        if self.active_panel == "queue" and change in {"queue", "track"}:
             self._refresh_context_panel()
 
     def _sync_system_media(self, *, refresh_metadata: bool = True) -> None:
@@ -278,7 +280,12 @@ class MusicPlayerApp(
             if self.playback.external_title:
                 title = self.playback.external_title
                 artist = self.playback.external_uploader
-                artwork_uri = self.playback.external_thumbnail
+                cache = getattr(self, "thumbnails", None)
+                artwork_uri = (
+                    cache.artwork_uri(self.playback.external_thumbnail)
+                    if cache is not None
+                    else self.playback.external_thumbnail
+                )
             elif self.playback.current_track_id:
                 try:
                     track = self.manager.get_track(self.playback.current_track_id)
@@ -290,7 +297,12 @@ class MusicPlayerApp(
                 else:
                     title = track.title or Path(track.filename).stem
                     artist = details.uploader
-                    artwork_uri = details.thumbnail
+                    cache = getattr(self, "thumbnails", None)
+                    artwork_uri = (
+                        cache.artwork_uri(details.thumbnail)
+                        if cache is not None
+                        else details.thumbnail
+                    )
                     # Melody does not currently persist album tags. The source
                     # name is still useful context in media panels without
                     # pretending it is an album title.
@@ -300,19 +312,26 @@ class MusicPlayerApp(
         else:
             title, artist, album, artwork_uri = self._system_media_metadata
 
-        has_media = bool(title)
+        has_media = bool(title) and self.playback.media_session_active
         self.backend.sync_media_session(
-            title=title,
+            title=title if has_media else "",
             artist=artist,
             album=album,
             artwork_uri=artwork_uri,
             duration_ms=self.playback.duration_ms,
             position_ms=self.playback.position_ms,
             playing=self.playback.playing,
-            has_next=has_media,
+            loading=self.playback.snapshot.loading,
+            has_next=has_media
+            and self.playback.queue.peek_next(automatic=True) is not None,
             has_previous=has_media,
             repeat_mode=self.playback.queue.repeat.value,
             shuffle=self.playback.queue.shuffle,
+            # A paused Android MediaSessionService is otherwise allowed to
+            # disappear with its notification when the app task is removed.
+            # Preserve it while Melody still owns a resumable queue; explicit
+            # Stop clears has_media and remains the teardown boundary.
+            keep_alive=has_media and bool(getattr(self.playback.queue, "items", ())),
         )
 
     def _media_action(self, action: str, seek_position_ms: int | None) -> None:
@@ -325,9 +344,7 @@ class MusicPlayerApp(
             if self.playback.playing:
                 self.playback.toggle()
         elif command == "stop":
-            if self.playback.playing:
-                self.playback.toggle()
-            self.playback.seek(0)
+            self.playback.stop()
         elif command == "skiptonext":
             self.playback.next()
         elif command == "skiptoprevious":
@@ -348,14 +365,13 @@ class MusicPlayerApp(
             relevant = pending[0] != "play" or (
                 generation is not None and self.playback.is_current_request(generation)
             )
-            if not relevant:
-                pass
-            elif record.status == "completed":
-                self._apply_track_action(record.track_ids, *pending)
-            else:
-                self._show_error(
-                    f"Couldn’t finish the requested action for {record.title}."
-                )
+            if relevant:
+                if record.status == "completed":
+                    self._apply_track_action(record.track_ids, *pending)
+                else:
+                    self._show_error(
+                        f"Couldn’t finish the requested action for {record.title}."
+                    )
         if (
             record.status in {"completed", "failed", "cancelled"}
             and self.playlist_import_session is not None
@@ -414,7 +430,9 @@ class MusicPlayerApp(
         self.tasks.close()
         self.persistence.close(wait=True)
         self.playback_workers.shutdown(wait=True, cancel_pending=True)
-        self.downloads.shutdown(wait=True)
+        # Closing a window must not wait for a slow network read or postprocess.
+        # Running jobs observe cancellation at their next yt-dlp callback.
+        self.downloads.shutdown(wait=False)
         self.workers.shutdown(wait=True, cancel_pending=True)
 
     def _submit_background(
@@ -453,22 +471,22 @@ class AppResources:
     store: ApplicationStore
     manager: MusicManager
     library: LibraryService
-    reconciliation: Any
     providers: ProviderRegistry
+    thumbnails: ThumbnailCache
     downloads: DownloadCoordinator
     available_track_ids: set[str]
 
     @classmethod
     def load(cls) -> AppResources:
-        """All startup filesystem, recovery and provider initialization is worker-only."""
+        """Load only state required to render and resume the local application."""
         directory = _application_data_directory()
         store = ApplicationStore(directory / "state.json")
         settings = store.settings
         manager = MusicManager(directory / "library.mmdb", settings.download_directory)
         library = LibraryService(manager, store)
-        reconciliation = library.reconcile()
         providers = ProviderRegistry(settings=settings)
-        downloads = DownloadCoordinator(manager, store, settings)
+        thumbnails = ThumbnailCache(directory / "thumbnails")
+        downloads = DownloadCoordinator(manager, store, settings, thumbnails=thumbnails)
         available = {
             str(track.id)
             for track in manager.list_tracks()
@@ -479,8 +497,8 @@ class AppResources:
             store,
             manager,
             library,
-            reconciliation,
             providers,
+            thumbnails,
             downloads,
             available,
         )

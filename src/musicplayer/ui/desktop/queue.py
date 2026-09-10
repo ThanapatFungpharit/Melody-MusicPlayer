@@ -30,7 +30,11 @@ def _queue_view(app: MusicPlayerApp) -> ft.Control:
                 ft.Row(
                     [
                         reorder_handle(current=current),
-                        _artwork(details.thumbnail, 48),
+                        _artwork(
+                            details.thumbnail,
+                            48,
+                            cache=getattr(app, "thumbnails", None),
+                        ),
                         ft.Column(
                             [
                                 ft.Text(

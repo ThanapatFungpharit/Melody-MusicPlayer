@@ -90,4 +90,5 @@ def _library_track_row(app, track, index, playlists=None) -> ft.Control:
         details.thumbnail,
         lambda _: app.playback.play_track(str(track.id)),
         more(app, title, app._library_track_menu(track, index, playlists)),
+        cache=getattr(app, "thumbnails", None),
     )

@@ -125,8 +125,8 @@ def _playlist_detail(app: MusicPlayerApp, playlist: Playlist) -> ft.Control:
             ],
             show_default_drag_handles=False,
             mouse_cursor=ft.MouseCursor.GRAB,
-            on_reorder=lambda event, pid=str(playlist.id): app._reorder_playlist(
-                pid, event.old_index, event.new_index
+            on_reorder=lambda event, pid=str(playlist.id): app._playlist_reordered(
+                pid, event
             ),
             expand=True,
         )
@@ -253,7 +253,11 @@ def _playlist_track_row(
         ft.Row(
             [
                 *leading,
-                _artwork(details.thumbnail, 48),
+                _artwork(
+                    details.thumbnail,
+                    48,
+                    cache=getattr(app, "thumbnails", None),
+                ),
                 ft.Column(
                     [
                         ft.Text(
@@ -297,7 +301,12 @@ def _playlist_card(app: MusicPlayerApp, playlist: Playlist) -> ft.Control:
             [
                 ft.Stack(
                     [
-                        _artwork(artwork, art_size, playlist=True),
+                        _artwork(
+                            artwork,
+                            art_size,
+                            playlist=True,
+                            cache=getattr(app, "thumbnails", None),
+                        ),
                         ft.Container(
                             ft.IconButton(
                                 ft.Icons.PLAY_ARROW_ROUNDED,

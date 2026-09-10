@@ -3,7 +3,9 @@ from __future__ import annotations
 import time
 import unittest
 from threading import Event
+from unittest.mock import patch
 
+from musicplayer.core import runtime_gate
 from musicplayer.core.concurrency import LazyBoundedExecutor, WorkerQueueFull
 
 
@@ -70,6 +72,66 @@ class LazyBoundedExecutorTests(unittest.TestCase):
             executor.submit(fail).result(timeout=1)
         self.assertEqual(executor.submit(lambda: 7).result(timeout=1), 7)
         executor.shutdown()
+
+
+class RuntimePreparationTests(unittest.TestCase):
+    def test_registered_work_does_not_start_until_the_feature_waits(self) -> None:
+        started = Event()
+
+        with (
+            patch.object(runtime_gate, "_PREPARATIONS", {}),
+            patch.object(runtime_gate, "_OPERATIONS", {}),
+        ):
+            runtime_gate.configure_runtime_preparation(
+                lambda: started.set() or "ready",
+                key=runtime_gate.MEDIA_BINARY_PREPARATION,
+            )
+            self.assertFalse(started.is_set())
+            self.assertEqual(
+                runtime_gate.wait_for_runtime_preparation(
+                    key=runtime_gate.MEDIA_BINARY_PREPARATION
+                ),
+                "ready",
+            )
+            self.assertTrue(started.is_set())
+
+    def test_optional_runtime_work_starts_without_blocking_local_startup(self) -> None:
+        started = Event()
+        release = Event()
+
+        def prepare() -> str:
+            started.set()
+            release.wait(timeout=2)
+            return "ready"
+
+        with patch.object(runtime_gate, "_PREPARATIONS", {}):
+            future = runtime_gate.start_runtime_preparation(prepare, key="test")
+            self.assertTrue(started.wait(timeout=1))
+            self.assertFalse(future.done())
+            release.set()
+            self.assertEqual(
+                runtime_gate.wait_for_runtime_preparation(key="test"), "ready"
+            )
+
+    def test_feature_gates_do_not_block_one_another(self) -> None:
+        media_ready = Event()
+
+        with patch.object(runtime_gate, "_PREPARATIONS", {}):
+            runtime_gate.start_runtime_preparation(
+                lambda: media_ready.set() or "media",
+                key=runtime_gate.MEDIA_BINARY_PREPARATION,
+            )
+
+            self.assertEqual(
+                runtime_gate.wait_for_runtime_preparation(key="unconfigured"), None
+            )
+            self.assertTrue(media_ready.wait(timeout=1))
+            self.assertEqual(
+                runtime_gate.wait_for_runtime_preparation(
+                    key=runtime_gate.MEDIA_BINARY_PREPARATION
+                ),
+                "media",
+            )
 
 
 if __name__ == "__main__":

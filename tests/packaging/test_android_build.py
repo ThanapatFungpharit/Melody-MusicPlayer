@@ -4,10 +4,40 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from tools.build_android import stage_android_native_libraries
+from tools.build_android import (
+    configure_single_task_activity,
+    stage_android_native_libraries,
+)
 
 
 class AndroidBuildTests(unittest.TestCase):
+    def test_launcher_activity_is_single_task(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            flutter = Path(directory)
+            manifest = flutter / "android/app/src/main/AndroidManifest.xml"
+            manifest.parent.mkdir(parents=True)
+            manifest.write_text(
+                """<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+  <application>
+    <activity android:name=".MainActivity" android:launchMode="singleTop">
+      <intent-filter>
+        <action android:name="android.intent.action.MAIN" />
+        <category android:name="android.intent.category.LAUNCHER" />
+      </intent-filter>
+    </activity>
+  </application>
+</manifest>
+""",
+                encoding="utf-8",
+            )
+
+            configure_single_task_activity(flutter)
+
+            configured = manifest.read_text(encoding="utf-8")
+            self.assertIn('android:launchMode="singleTask"', configured)
+            self.assertIn('android:documentLaunchMode="never"', configured)
+
     def test_programs_are_staged_as_abi_native_libraries(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -53,6 +53,7 @@ def _queue_view(app) -> ft.Control:
                 ),
                 more(app, _track_title(track), actions),
                 selected=current,
+                cache=getattr(app, "thumbnails", None),
             )
         )
     return scroll_page(

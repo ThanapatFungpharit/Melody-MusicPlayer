@@ -7,15 +7,15 @@ Melody is a cross-platform music player and downloader built with Python 3.12+, 
 - Paged YouTube search with track-list and artwork-grid views; pasted playlist URLs load their tracks with playlist-aware pagination
 - Optional manually uploaded cookie-file sessions for personalized YouTube search, signed-in playlists, stream previews, and downloads
 - Stream previews directly from Search
-- Individual, multi-YouTube-URL batch, and playlist downloads with concurrent workers, per-song progress, cancel, retry, isolated failure details, and persistent history
+- Individual, multi-YouTube-URL batch, and playlist downloads with concurrent workers, per-song progress, cancel, retry, isolated failure details, persistent history, and cover artwork embedded in every downloaded media file plus a derived offline UI cache
 - Search actions have one clear intent: Play reuses the intact library file or downloads it and starts playback when ready; Download stores it without playing. Both actions reuse an existing file or join an in-flight request instead of creating another copy.
 - Automatic import of completed audio into the existing binary `MusicManager` library
 - Native multi-file import for MP3, M4A, Opus, WAV, FLAC, OGG, and AAC, with content-hash duplicate detection
-- Persistent playlists with duplicate-aware YouTube playlist import, bulk multi-select track adding, ordered tracks, rename/delete, copy/move, and safe removal that does not delete audio files
+- Persistent playlists with duplicate-aware YouTube playlist import, bulk multi-select track adding, ordered tracks, desktop drag-to-reorder, touch move-up/down actions, rename/delete, copy/move, and safe removal that does not delete audio files
 - Searchable/sortable track library, favorites, title editing, explicit uploader/channel credits, duplicate-by-source detection, and integrity-aware file paths
-- Persistent playback queue with play-next, append, reorder, remove, clear-upcoming, shuffle, repeat-track, and repeat-queue
+- Persistent playback queue with play-next, append, reorder, remove, clear-upcoming, a visible one-time shuffle reorder, repeat-track, and repeat-queue
 - Background playback while Melody is minimized, another app is active, or a mobile device is locked
-- Lock-screen, notification-panel, Control Center, and desktop system-media controls with synchronized artwork, title, artist, playback state, seeking, and previous/next actions
+- Lock-screen, notification-panel, Control Center, and desktop system-media controls with synchronized artwork, title, artist, playback state, seeking, and previous/next actions; Pause keeps the session available and explicit Stop removes it
 - Shared playback with platform-appropriate controls: desktop seek and precise volume controls with media-key/keyboard handling; mobile touch controls with mute/restore while the device provides media volume buttons
 - Dedicated mobile and desktop presentation layers with separate navigation and interaction models: mobile bottom navigation, full-screen panels, touch-sized actions, and bottom-sheet menus; desktop navigation rail, docked utility panels, dense toolbars, keyboard shortcuts, hover states, context menus, and drag-to-reorder interactions
 - Recent tracks, playback/search history, session queue state, light/dark/system themes, configurable accent palettes, and configurable YouTube/download settings
@@ -61,18 +61,20 @@ Theme settings follow the same shared-state model. The Theme selector previews L
 
 The latency-sensitive paths are deliberately bounded:
 
+- Startup performs no network request, updater probe, media-tool download, or full-library hash/stray-file scan. It loads the local state needed for the first view and uses cheap file availability checks; SHA-256 integrity checks remain available at the explicit feature boundaries that require them.
 - Search, stream resolution, local imports, and managed-audio reads share a pool capped at two active and two pending tasks. The pool and its threads do not exist while idle; excess submissions are rejected immediately so UI actions never block behind or add to an unbounded queue.
 - The downloader creates its own pool only on the first download. Active work is capped by the configured concurrency and pending work has the same cap, for a maximum of `2 × concurrent_downloads` accepted tasks. The pool retires after the final task, and overload is reported per song without cancelling an otherwise valid batch.
-- Local audio files are read on the bounded I/O pool. Generation checks discard stale results when the user changes tracks before a read finishes, preventing both UI blocking and activation of obsolete audio bytes.
+- Local audio files are resolved on the bounded I/O pool. The next predicted track is prepared speculatively, and the long-lived native service swaps a ready candidate decoder without remounting Flet services or forcing a page-wide update. Generation checks discard stale Python and native work when the user changes tracks rapidly.
 - Playback position and duration events update only the seek slider and time labels instead of rebuilding the complete player bar, re-reading track metadata, and recreating artwork on every tick.
 - System media state is updated immediately for track, transport, queue-mode, and artwork changes, while position-only updates are throttled to once every five seconds. The operating system extrapolates the playhead between updates, preserving an accurate seek surface without waking the Python UI on every audio tick.
 - Returning from the background reconciles the UI with the native player's current position and duration before the media-session timeline is corrected, so the in-app seek surface does not jump back to its last foreground value.
-- Android holds the audio player's wake lock only while playback requires it; Melody deliberately leaves the media session's optional Wi-Fi and background keepalive locks disabled. iOS uses the native playback audio-session category, and the underlying player handles transient audio-focus interruptions such as calls before resuming when the operating system restores focus.
+- Android keeps the foreground media session attached while a resumable queue exists, including while paused, and releases its keep-alive resources on explicit Stop. iOS uses the native playback audio-session category, and the underlying player handles transient audio-focus interruptions such as calls before resuming when the operating system restores focus.
 - Desktop volume changes reach the audio backend continuously while dragging, but the durable setting is written only when the drag settles. Mobile delegates loudness to the device's media volume controls and exposes a shared mute/restore capability; button and mute changes remain immediately durable.
 - Starting a track commits play count, last-played time, recents, history, and the current session queue in one atomic state-file replacement. Private application state uses compact JSON to reduce serialization and disk traffic.
 - Download callbacks notify the UI at most five times per second and checkpoint non-terminal progress at most once per second. Completion, failure, cancellation, and status transitions are still immediate, so the trade-off is only that a forced process termination can lose up to one second of transient progress.
-- Library source/hash duplicate checks use in-memory indexes, newest-first ordering is cached until membership changes, shuffled queue selection uses constant auxiliary space, and library rows share one playlist snapshot per render. The indexes and ordering cache use O(n) additional memory to avoid repeated O(n) scans and O(n log n) sorts.
-- Core task results, application download history, and shuffled previous-track history are each capped at 250 records. Temporary destination reservations are released immediately after a move, so repeated downloads cannot grow bookkeeping structures without bound. The shuffle cap means “previous” remembers the latest 250 shuffled transitions rather than an unlimited session lifetime.
+- yt-dlp writes descriptive metadata first and burns the thumbnail into the final MP3, M4A, or Opus container last. The background worker reads the cover back from the completed container before committing it; when artwork was advertised or downloaded but embedded art does not exist, the download fails instead of silently creating a cache-only result. Verified embedded bytes are also atomically copied to app-private storage so UI images and native media sessions remain fast and offline without reparsing audio files.
+- Library source/hash duplicate checks use in-memory indexes, newest-first ordering is cached until membership changes, shuffle performs one O(n) reorder and then uses ordinary sequential traversal, and library rows share one playlist snapshot per render. The visible queue is the exact upcoming playback order.
+- Core task results and application download history are each capped at 250 records. Temporary destination reservations are released immediately after a move, so repeated downloads cannot grow bookkeeping structures without bound.
 
 Atomic temporary-file replacement and `fsync` are retained for settled and terminal state. This favors correctness and crash safety while coalescing only high-frequency intermediate updates. The worker caps deliberately trade unlimited burst acceptance for predictable CPU/RAM usage and responsive overload behavior.
 
@@ -85,12 +87,13 @@ uv sync
 uv run musicplayer
 ```
 
-On the first source-tree launch, `uv run musicplayer` automatically downloads
-the pinned FFmpeg archive for the current desktop platform and architecture,
-verifies its SHA-256 checksum, and extracts only FFmpeg and FFprobe. Later
-launches reuse the verified cached bundle. Android and packaged desktop builds
-continue to prepare their native tools through their build wrappers. Melody
-never selects a system installation from `PATH`.
+On the first source-tree download, Melody prepares the pinned FFmpeg archive for
+the current desktop platform and architecture. Launch only registers that
+on-demand operation: it performs no fetch, checksum pass, extraction, or encoder
+probe. The download runs the preparation on its background worker; local startup
+and playback do not wait for it. Later downloads reuse the verified cached
+bundle. Android and packaged desktop builds prepare their native tools through
+their build wrappers. Melody never selects a system installation from `PATH`.
 
 Application state uses the native per-user data location on every system:
 
@@ -106,12 +109,12 @@ without broad storage permissions. The location can be changed in Settings.
 
 YouTube access is anonymous by default. To use a signed-in session, export a UTF-8 Netscape-format `cookies.txt` file and upload it in Settings. Melody validates the file and copies it to the platform's private application-data directory. It never detects browsers or reads their cookie databases, so the same workflow is available on desktop and Android. Cookie files contain sensitive session credentials and should not be shared.
 
-Melody always ships with an immutable bundled `yt-dlp` fallback. At startup it
-validates the updater state and its trusted pure-Python `py3-none-any` wheels,
-then can activate a newer verified release from the writable application-data
-directory. Downloads are SHA-256 checked and installed with atomic file
-operations; network, cache, and recovery failures leave startup on the bundled
-version. At most the current and previous verified runtime wheels are retained.
+Melody uses the immutable, release-tested `yt-dlp` version bundled with the app.
+Normal launch does not contact PyPI, validate a writable runtime wheel, run an
+import probe, or mutate `sys.path`; providers import the bundled dependency only
+when a YouTube feature is requested. The crash-safe runtime updater remains an
+explicit maintenance facility, but it is intentionally outside the application
+startup path.
 
 ## Test and lint
 
@@ -180,6 +183,10 @@ uv run --locked --no-dev --group build python -m tools.build_android aab -- --ye
 
 The default Android build supports `arm64-v8a`, `armeabi-v7a`, and `x86_64`,
 targets Android 10/API 29 or newer, and bundles both `ffmpeg` and `ffprobe`.
+The wrapper also patches Flet's generated launcher activity to `singleTask`
+with document launching disabled, so launcher taps and media-notification
+intents route back to the existing player task instead of creating another UI
+and playback owner.
 Use `--architecture arm64`, `--architecture arm`, or `--architecture x86_64`
 before `--` to build a single ABI. The release workflow uploads each
 side-loadable APK as an architecture-specific artifact and uploads the Google

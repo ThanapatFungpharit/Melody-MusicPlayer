@@ -20,18 +20,62 @@ class ManagedAudioErrorEvent(ft.Event["ManagedAudio"]):
     message: str
 
 
+@dataclass
+class ManagedAudioLoadedEvent(ft.Event["ManagedAudio"]):
+    generation: int
+
+
+@dataclass
+class ManagedAudioPositionChangeEvent(ft.Event["ManagedAudio"]):
+    position: int
+    generation: int
+
+
+@dataclass
+class ManagedAudioDurationChangeEvent(ft.Event["ManagedAudio"]):
+    duration: int
+    generation: int
+
+
+@dataclass
+class ManagedAudioStateChangeEvent(ft.Event["ManagedAudio"]):
+    state: str
+    generation: int
+
+
 @ft.control("ManagedAudio")
 class ManagedAudio(fa.Audio):
     on_error: ft.EventHandler[ManagedAudioErrorEvent] | None = None
+    on_loaded: ft.EventHandler[ManagedAudioLoadedEvent] | None = None
+    on_position_change: ft.EventHandler[ManagedAudioPositionChangeEvent] | None = None
+    on_duration_change: ft.EventHandler[ManagedAudioDurationChangeEvent] | None = None
+    on_state_change: ft.EventHandler[ManagedAudioStateChangeEvent] | None = None
+
+    async def load_source(self, source: AudioSource, generation: int) -> None:
+        await self._invoke_method(
+            "load_source", {"source": source, "generation": int(generation)}
+        )
+
+    async def preload_source(self, source: AudioSource) -> None:
+        await self._invoke_method("preload_source", {"source": source})
+
+    async def cancel_preload(self) -> None:
+        await self._invoke_method("cancel_preload")
+
+    async def cancel_load(self) -> None:
+        await self._invoke_method("cancel_load")
+
+    async def clear_source(self) -> None:
+        await self._invoke_method("clear_source")
 
 
 class FletAudioBackend:
     """Lifecycle-safe adapter around Flet's asynchronous audio service.
 
-    A new service is mounted for every source. Playback and seeking are held
-    until the native client confirms ``on_loaded``; RPCs then run serially on
-    the page loop. This avoids racing a source update with ``play()`` and keeps
-    Flet's 30-second RPC failures from escaping its Future callback.
+    One service stays mounted for the page lifetime. Candidate sources prepare
+    beside the active decoder and swap only after native readiness. Transport
+    and source RPCs use separate locks so pause remains responsive during a
+    handoff, and every operation is bounded at this final native boundary.
     """
 
     _OPERATION_TIMEOUT_SECONDS = 12
@@ -40,7 +84,12 @@ class FletAudioBackend:
     def __init__(self, page: ft.Page, *, use_device_volume: bool = False) -> None:
         self.page = page
         self._use_device_volume = use_device_volume
-        self.audio: fa.Audio | None = None
+        self.audio: fa.Audio | None = ManagedAudio(
+            src=None,
+            autoplay=False,
+            volume=1.0,
+            release_mode=fa.ReleaseMode.STOP,
+        )
         self.on_position: Callable[[int], None] | None = None
         self.on_loaded: Callable[[], None] | None = None
         self.on_duration: Callable[[int], None] | None = None
@@ -52,19 +101,39 @@ class FletAudioBackend:
         self._generation = 0
         self._completed_generation = -1
         self._loaded = False
+        self._has_active_source = False
         self._closing = False
         self._pending_play_position: int | None = None
         self._pending_seek_position: int | None = None
         self._load_watchdog: Future[Any] | None = None
         self._operation_lock = asyncio.Lock()
+        self._transport_lock = asyncio.Lock()
         self._operations: set[Future[Any]] = set()
+        self._preload_generation = 0
+        self._preload_operation: Future[Any] | None = None
         self._media_operation_lock = asyncio.Lock()
         self._media_generation = 0
         self._media_snapshot: tuple[object, ...] | None = None
         self._media_pending_snapshot: tuple[object, ...] | None = None
         self._media_session_active = False
+        self._media_reattach_pending = False
         self.media_session = BackgroundAudioSession(on_action=self._media_action)
         self.page.services.append(self.media_session)
+        assert isinstance(self.audio, ManagedAudio)
+        self.audio.on_loaded = lambda event: self._loaded_event(event.generation)
+        self.audio.on_position_change = lambda event: self._position_changed(
+            event, event.generation
+        )
+        self.audio.on_duration_change = lambda event: self._duration_changed(
+            event, event.generation
+        )
+        self.audio.on_state_change = lambda event: self._state_changed(
+            event, event.generation
+        )
+        self.audio.on_error = lambda event: self._source_error(
+            event.message, self._generation
+        )
+        self.page.services.append(self.audio)
 
     def bind(
         self,
@@ -95,10 +164,12 @@ class FletAudioBackend:
         duration_ms: int = 0,
         position_ms: int = 0,
         playing: bool = False,
+        loading: bool = False,
         has_next: bool = True,
         has_previous: bool = True,
         repeat_mode: str = "off",
         shuffle: bool = False,
+        keep_alive: bool = False,
     ) -> None:
         """Publish a throttled, coherent snapshot to native system controls.
 
@@ -111,9 +182,11 @@ class FletAudioBackend:
         duration = max(0, int(duration_ms))
         position = max(0, int(position_ms))
         is_playing = bool(playing)
+        is_loading = bool(loading)
         can_skip_next = bool(has_next)
         can_skip_previous = bool(has_previous)
         is_shuffled = bool(shuffle)
+        should_keep_alive = bool(keep_alive)
         position_marker = position // 5_000 if is_playing else position
         snapshot: tuple[object, ...] = (
             clean_title,
@@ -123,10 +196,12 @@ class FletAudioBackend:
             duration,
             position_marker,
             is_playing,
+            is_loading,
             can_skip_next,
             can_skip_previous,
             repeat_mode,
             is_shuffled,
+            should_keep_alive,
         )
         if (
             snapshot == self._media_snapshot
@@ -149,10 +224,13 @@ class FletAudioBackend:
             "duration_ms": duration,
             "position_ms": position,
             "playing": is_playing,
+            "loading": is_loading,
             "has_next": can_skip_next,
             "has_previous": can_skip_previous,
             "repeat_mode": repeat_mode,
             "shuffle": is_shuffled,
+            "keep_alive": should_keep_alive,
+            "reattach": self._media_reattach_pending,
         }
         try:
             self.page.run_task(
@@ -171,6 +249,15 @@ class FletAudioBackend:
                 "Media-session update skipped after session disposal", exc_info=True
             )
 
+    def invalidate_media_session(self) -> None:
+        """Force the next snapshot to reattach after an app lifecycle resume."""
+        if self._closing:
+            return
+        self._media_generation += 1
+        self._media_snapshot = None
+        self._media_pending_snapshot = None
+        self._media_reattach_pending = True
+
     def load(self, source: AudioSource) -> None:
         if self._closing:
             return
@@ -182,88 +269,92 @@ class FletAudioBackend:
         self._pending_play_position = None
         self._pending_seek_position = None
 
-        # Sources can become ready on a download or file-I/O worker. Flet page
-        # patches are event-loop-affine: patching ``page.services`` from that
-        # worker updates Python state but can leave the native Audio service
-        # unmounted, with no loaded/state/error event ever arriving. Always
-        # marshal service replacement to the page loop.
-        try:
-            self.page.run_task(self._mount_source, source, generation)
-        except Exception:
-            logger.exception("Audio source could not be scheduled for mounting")
+        if not isinstance(self.audio, ManagedAudio):
             self._report_error("The audio player could not start loading this track.")
-
-    async def _mount_source(self, source: AudioSource, generation: int) -> None:
-        if self._closing or generation != self._generation:
             return
-        previous = self.audio
-        try:
-            if previous is not None:
-                try:
-                    self.page.services.remove(previous)
-                except ValueError:
-                    pass
+        self._schedule(
+            self.audio.load_source, source, generation, generation=generation
+        )
+        self._load_watchdog = self.page.run_task(self._watch_load, generation)
 
-            # The native bridge selects DeviceFileSource directly. Flet's generic
-            # resolver calls existsSync on the Flutter UI isolate for local paths.
-            audio_type = ManagedAudio if isinstance(source, str) else fa.Audio
-            self.audio = audio_type(
-                src=source,
-                autoplay=False,
-                volume=self._volume,
-                release_mode=fa.ReleaseMode.STOP,
-                on_loaded=lambda _event: self._loaded_event(generation),
-                on_position_change=lambda event: self._position_changed(
-                    event, generation
-                ),
-                on_duration_change=lambda event: self._duration_changed(
-                    event, generation
-                ),
-                on_state_change=lambda event: self._state_changed(event, generation),
-            )
-            if isinstance(self.audio, ManagedAudio):
-                self.audio.on_error = lambda event: self._source_error(
-                    event.message, generation
-                )
-            self.page.services.append(self.audio)
-            self.page.update()
-            self._load_watchdog = self.page.run_task(self._watch_load, generation)
+    def preload(self, source: AudioSource) -> None:
+        """Prepare one likely next source without disturbing active playback."""
+        if self._closing or not isinstance(self.audio, ManagedAudio):
+            return
+        self._preload_generation += 1
+        previous = self._preload_operation
+        self._preload_operation = None
+        if previous is not None:
+            previous.cancel()
+        generation = self._preload_generation
+        try:
+            operation = self.page.run_task(self._run_preload, source, generation)
         except Exception:
-            logger.exception("Audio source could not be mounted")
-            if generation != self._generation or self._closing:
-                return
-            self._loaded = False
-            self._cancel_load_watchdog()
-            self._pending_play_position = None
-            self._pending_seek_position = None
-            if self.audio is not None:
-                try:
-                    self.page.services.remove(self.audio)
-                except ValueError:
-                    pass
-                self.audio = None
-            if self.on_playing:
-                self.on_playing(False)
-            self._report_error("The audio player could not load this track.")
+            logger.debug("Audio preload could not be scheduled", exc_info=True)
+            return
+        self._preload_operation = operation
+
+    def cancel_preload(self) -> None:
+        self._preload_generation += 1
+        operation = self._preload_operation
+        self._preload_operation = None
+        if operation is not None:
+            operation.cancel()
+        if self._closing or not isinstance(self.audio, ManagedAudio):
+            return
+        try:
+            self.page.run_task(self.audio.cancel_preload)
+        except Exception:  # noqa: BLE001 - Flet may reject after page disposal
+            logger.debug("Audio preload cancellation could not be scheduled")
+
+    async def _run_preload(self, source: AudioSource, generation: int) -> None:
+        if (
+            self._closing
+            or generation != self._preload_generation
+            or not isinstance(self.audio, ManagedAudio)
+        ):
+            return
+        try:
+            await asyncio.wait_for(
+                self.audio.preload_source(source),
+                timeout=self._OPERATION_TIMEOUT_SECONDS,
+            )
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            # Speculation must never break current playback. The normal load
+            # path retries independently if this source becomes current.
+            logger.debug("Native next-track preload failed", exc_info=True)
+        finally:
+            if generation == self._preload_generation:
+                self._preload_operation = None
 
     def play(self, position_ms: int = 0) -> None:
         position = max(0, int(position_ms))
         if not self._loaded or self.audio is None:
             self._pending_play_position = position
             return
-        self._schedule(self.audio.play, position, generation=self._generation)
+        self._schedule_transport(self.audio.play, position, generation=self._generation)
 
     def pause(self) -> None:
-        if not self._loaded or self.audio is None:
-            self._pending_play_position = None
+        if self.audio is None:
             return
-        self._schedule(self.audio.pause, generation=self._generation)
+        if not self._loaded:
+            self._pending_play_position = None
+            if self._has_active_source:
+                self._schedule_transport(self.audio.pause, generation=self._generation)
+            return
+        self._schedule_transport(self.audio.pause, generation=self._generation)
 
     def resume(self) -> None:
-        if not self._loaded or self.audio is None:
-            self._pending_play_position = self._pending_seek_position or 0
+        if self.audio is None:
             return
-        self._schedule(self.audio.resume, generation=self._generation)
+        if not self._loaded:
+            self._pending_play_position = self._pending_seek_position or 0
+            if self._has_active_source:
+                self._schedule_transport(self.audio.resume, generation=self._generation)
+            return
+        self._schedule_transport(self.audio.resume, generation=self._generation)
 
     def seek(self, position_ms: int) -> None:
         position = max(0, int(position_ms))
@@ -272,7 +363,7 @@ class FletAudioBackend:
             if self._pending_play_position is not None:
                 self._pending_play_position = position
             return
-        self._schedule(self.audio.seek, position, generation=self._generation)
+        self._schedule_transport(self.audio.seek, position, generation=self._generation)
 
     def close(self) -> None:
         # The native service is disposed with the page. Starting an RPC during
@@ -284,6 +375,10 @@ class FletAudioBackend:
         self._media_pending_snapshot = None
         self._cancel_load_watchdog()
         self._cancel_operations()
+        operation = self._preload_operation
+        self._preload_operation = None
+        if operation is not None:
+            operation.cancel()
         self._pending_play_position = None
         self._pending_seek_position = None
 
@@ -306,7 +401,7 @@ class FletAudioBackend:
         if self._closing or generation != self._generation or self.audio is None:
             return
         try:
-            async with self._operation_lock:
+            async with self._transport_lock:
                 if (
                     self._closing
                     or generation != self._generation
@@ -356,6 +451,7 @@ class FletAudioBackend:
         if generation != self._generation or self._closing or self.audio is None:
             return
         self._loaded = True
+        self._has_active_source = True
         self._cancel_load_watchdog()
         if self.on_loaded:
             self.on_loaded()
@@ -364,9 +460,13 @@ class FletAudioBackend:
         self._pending_play_position = None
         self._pending_seek_position = None
         if pending_play is not None:
-            self._schedule(self.audio.play, pending_play, generation=generation)
+            self._schedule_transport(
+                self.audio.play, pending_play, generation=generation
+            )
         elif pending_seek is not None:
-            self._schedule(self.audio.seek, pending_seek, generation=generation)
+            self._schedule_transport(
+                self.audio.seek, pending_seek, generation=generation
+            )
 
     def _schedule(
         self,
@@ -388,6 +488,52 @@ class FletAudioBackend:
                 "The audio player did not respond. The playback service may "
                 "have disconnected."
             )
+
+    def _schedule_transport(
+        self,
+        operation: Callable[..., Awaitable[Any]],
+        *args: Any,
+        generation: int,
+    ) -> None:
+        if self._closing or generation != self._generation:
+            return
+        try:
+            future = self.page.run_task(
+                self._run_transport_operation, operation, args, generation
+            )
+            self._operations.add(future)
+            future.add_done_callback(self._operations.discard)
+        except Exception:
+            logger.exception("Audio transport operation could not be scheduled")
+            self._report_error(
+                "The audio player did not respond. The playback service may "
+                "have disconnected."
+            )
+
+    async def _run_transport_operation(
+        self,
+        operation: Callable[..., Awaitable[Any]],
+        args: tuple[Any, ...],
+        generation: int,
+    ) -> None:
+        if self._closing or generation != self._generation:
+            return
+        try:
+            async with self._transport_lock:
+                if self._closing or generation != self._generation:
+                    return
+                await asyncio.wait_for(
+                    operation(*args), timeout=self._OPERATION_TIMEOUT_SECONDS
+                )
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            logger.exception("Audio transport operation failed")
+            if not self._closing and generation == self._generation:
+                self._report_error(
+                    "The audio player did not respond. The track may be unsupported or "
+                    "the playback service may have disconnected."
+                )
 
     async def _run_operation(
         self,
@@ -440,6 +586,20 @@ class FletAudioBackend:
         self._operations.clear()
         # Obsolete RPCs cannot hold the next player's transport lock hostage.
         self._operation_lock = asyncio.Lock()
+        self._transport_lock = asyncio.Lock()
+
+    def cancel_load(self) -> None:
+        """Supersede native preparation while leaving the active source intact."""
+        if self._closing or not isinstance(self.audio, ManagedAudio):
+            return
+        self._generation += 1
+        self._loaded = self._has_active_source
+        self._pending_play_position = None
+        self._pending_seek_position = None
+        self._cancel_load_watchdog()
+        self._cancel_operations()
+        generation = self._generation
+        self._schedule(self.audio.cancel_load, generation=generation)
 
     def _source_error(self, message: str, generation: int) -> None:
         if generation == self._generation and not self._closing:
@@ -447,24 +607,18 @@ class FletAudioBackend:
             self._report_error(message)
 
     def discard_source(self) -> None:
-        """Invalidate callbacks immediately, then dispose on the page loop."""
+        """Invalidate callbacks and release native decoders without unmounting."""
         self._generation += 1
         self._loaded = False
+        self._has_active_source = False
         self._pending_play_position = self._pending_seek_position = None
         self._cancel_load_watchdog()
         self._cancel_operations()
-        self.page.run_task(self._unmount_source, self._generation)
-
-    async def _unmount_source(self, generation: int) -> None:
-        if generation != self._generation or self._closing:
+        self.cancel_preload()
+        if self._closing or not isinstance(self.audio, ManagedAudio):
             return
-        if self.audio is not None:
-            try:
-                self.page.services.remove(self.audio)
-            except ValueError:
-                pass
-            self.audio = None
-            self.page.update()
+        generation = self._generation
+        self._schedule(self.audio.clear_source, generation=generation)
 
     async def _run_media_sync(
         self,
@@ -498,6 +652,8 @@ class FletAudioBackend:
                 # the success marker used to coalesce future progress updates.
                 if generation == self._media_generation:
                     self._media_snapshot = snapshot
+                    if payload.get("reattach"):
+                        self._media_reattach_pending = False
                     if self._media_pending_snapshot == snapshot:
                         self._media_pending_snapshot = None
         except asyncio.CancelledError:
@@ -521,28 +677,30 @@ class FletAudioBackend:
             self.on_error(message)
 
     def _position_changed(
-        self, event: fa.AudioPositionChangeEvent, generation: int
+        self, event: ManagedAudioPositionChangeEvent, generation: int
     ) -> None:
         if generation == self._generation and self.on_position:
             self.on_position(event.position)
 
     def _duration_changed(
-        self, event: fa.AudioDurationChangeEvent, generation: int
+        self, event: ManagedAudioDurationChangeEvent, generation: int
     ) -> None:
         if generation == self._generation and self.on_duration:
-            self.on_duration(int(event.duration.in_milliseconds))
+            self.on_duration(int(event.duration))
 
-    def _state_changed(self, event: fa.AudioStateChangeEvent, generation: int) -> None:
+    def _state_changed(
+        self, event: ManagedAudioStateChangeEvent, generation: int
+    ) -> None:
         if generation != self._generation:
             return
-        if event.state is fa.AudioState.COMPLETED:
+        if event.state == "completed":
             if self._completed_generation == generation:
                 return
             self._completed_generation = generation
             if self.on_completed:
                 self.on_completed()
         elif self.on_playing:
-            self.on_playing(event.state is fa.AudioState.PLAYING)
+            self.on_playing(event.state == "playing")
 
     def _media_action(self, event: MediaSessionActionEvent) -> None:
         if self._closing or self.on_media_action is None:

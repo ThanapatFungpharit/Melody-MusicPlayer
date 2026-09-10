@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,8 +10,9 @@ from uuid import UUID
 import flet as ft
 
 from musicplayer.app import MusicPlayerApp
-from musicplayer.application.models import SearchResult, TrackDetails
+from musicplayer.application.models import DownloadRecord, SearchResult, TrackDetails
 from musicplayer.application.providers import RemotePlaylist
+from musicplayer.core.concurrency import WorkerQueueFull
 from musicplayer.core.downloader import DownloadTask
 from musicplayer.core.library import MusicManager
 from musicplayer.core.library.utils import source_key
@@ -62,6 +64,65 @@ class _Downloads:
 
     def complete(self, url: str) -> None:
         self.active.discard(source_key(url))
+
+
+class _InlineTasks:
+    async def io(self, operation, *args, **kwargs):
+        return operation(*args, **kwargs)
+
+
+class _ParallelDownloads:
+    """Coordinator fixture that completes jobs when their records are read."""
+
+    def __init__(self, manager: MusicManager, music: Path, capacity: int = 2) -> None:
+        self.manager = manager
+        self.music = music
+        self.capacity = capacity
+        self.active: dict[str, str] = {}
+        self.records: dict[str, DownloadRecord] = {}
+        self.started: list[str] = []
+        self.max_active = 0
+
+    def is_source_active(self, url: str) -> bool:
+        return source_key(url) in self.active
+
+    def request(self, result: SearchResult) -> DownloadTask:
+        if len(self.active) >= self.capacity:
+            raise WorkerQueueFull("test download queue is full")
+        task = DownloadTask(UUID(int=len(self.started) + 1))
+        task_id = str(task.id)
+        key = source_key(result.url)
+        path = self.music / f"{result.id}.mp3"
+        path.write_bytes(f"audio:{result.id}".encode())
+        track_id = self.manager.add_track(
+            path,
+            source=result.url,
+            title=result.title,
+        )
+        self.started.append(result.id)
+        self.active[key] = task_id
+        self.max_active = max(self.max_active, len(self.active))
+        self.records[task_id] = DownloadRecord(
+            id=task_id,
+            url=result.url,
+            title=result.title,
+            status="completed",
+            progress=1.0,
+            track_ids=[str(track_id)],
+        )
+        return task
+
+    def request_with_ownership(self, result: SearchResult) -> tuple[DownloadTask, bool]:
+        return self.request(result), True
+
+    def get(self, task_id: str) -> DownloadRecord | None:
+        record = self.records.get(task_id)
+        if record is not None:
+            self.active.pop(source_key(record.url), None)
+        return record
+
+    def available_track(self, url: str):
+        return self.manager.find_track_by_source(url)
 
 
 class PlaylistFeatureTests(unittest.TestCase):
@@ -212,6 +273,39 @@ class PlaylistFeatureTests(unittest.TestCase):
         self.assertEqual(
             [str(track.id) for track in self.manager.playlist_tracks(repeated_id)],  # ty: ignore[invalid-argument-type]
             [existing, downloaded],
+        )
+
+    def test_playlist_import_keeps_multiple_downloads_in_flight(self) -> None:
+        downloads = _ParallelDownloads(self.manager, self.music, capacity=2)
+        self.app.downloads = downloads  # ty: ignore[invalid-assignment]
+        self.app.tasks = _InlineTasks()
+        remote = RemotePlaylist(
+            "Parallel mix",
+            tuple(
+                self._result(video_id, title)
+                for video_id, title in (
+                    ("one", "First"),
+                    ("two", "Second"),
+                    ("three", "Third"),
+                )
+            ),
+        )
+
+        asyncio.run(self.app._import_playlist(remote, 0))
+
+        self.assertEqual(downloads.started, ["one", "two", "three"])
+        self.assertEqual(downloads.max_active, 2)
+        self.assertEqual(
+            [
+                track.title
+                for track in self.manager.playlist_tracks(
+                    self.app.selected_playlist_id  # ty: ignore[invalid-argument-type]
+                )
+            ],
+            ["First", "Second", "Third"],
+        )
+        self.app._show_message.assert_called_with(  # ty: ignore[unresolved-attribute]
+            "Imported 3 of 3 tracks into “Parallel mix”: reused 0, downloaded 3."
         )
 
     def test_import_accepts_a_download_record_that_reused_local_file_content(

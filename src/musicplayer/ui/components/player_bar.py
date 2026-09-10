@@ -113,7 +113,11 @@ class PlaybackBindings:
             if playback.snapshot.loading:
                 credit = "Preparing track…"
             self.title.value, self.credit.value = title, credit
-            self.art.content = _artwork(thumbnail, int(self.art.width or 48))
+            self.art.content = _artwork(
+                thumbnail,
+                int(self.art.width or 48),
+                cache=getattr(self.app, "thumbnails", None),
+            )
             self.favorite.icon = (
                 ft.Icons.FAVORITE_ROUNDED
                 if favorite

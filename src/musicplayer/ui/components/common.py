@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import random
 from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
@@ -28,9 +27,7 @@ class SharedUIComponents(_Base):
         self, tracks: Sequence[Track], *, shuffle: bool = False
     ) -> None:
         ids = [str(track.id) for track in tracks]
-        if shuffle:
-            random.shuffle(ids)
-        self.playback.play_tracks(ids)
+        self.playback.play_tracks(ids, shuffle=True if shuffle else None)
 
     def _queue_collection(self, tracks: Sequence[Track]) -> None:
         count = self.playback.add_last_many(str(track.id) for track in tracks)
@@ -135,11 +132,18 @@ def _empty_state(
     )
 
 
-def _artwork(url: str, size: int, *, playlist: bool = False) -> ft.Control:
+def _artwork(
+    url: str | bytes,
+    size: int,
+    *,
+    playlist: bool = False,
+    cache: Any | None = None,
+) -> ft.Control:
     radius = 14 if size >= 100 else 12
     if url:
+        source = cache.image_source(url) if cache is not None else url
         return ft.Image(
-            src=url,
+            src=source,
             width=size,
             height=size,
             fit=ft.BoxFit.COVER,

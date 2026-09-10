@@ -14,6 +14,7 @@ class DownloadErrorKind(str, Enum):
     EXTRACTOR = "extractor"
     RATE_LIMIT = "rate_limit"
     DISK = "disk"
+    POSTPROCESSING = "postprocessing"
     CANCELLED = "cancelled"
     UNSUPPORTED = "unsupported"
     UNKNOWN = "unknown"
@@ -105,8 +106,16 @@ def classify_download_error(error: Exception | str) -> DownloadFailure:
     ):
         return DownloadFailure(
             DownloadErrorKind.EXTRACTOR,
-            "The provider's extractor failed. Restart Melody to check for a compatible downloader update, then retry.",
+            "The provider's extractor failed. Install the latest Melody release, then retry.",
             "update_downloader",
+        )
+    if "thumbnail" in message and any(
+        word in message for word in ("embed", "embedded", "embedding")
+    ):
+        return DownloadFailure(
+            DownloadErrorKind.POSTPROCESSING,
+            "Cover artwork could not be embedded in the audio file. Retry the download or choose another audio format.",
+            "retry",
         )
     if any(isinstance(item, (TimeoutError, ConnectionError)) for item in chain) or any(
         word in message

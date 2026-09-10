@@ -5,7 +5,7 @@ import inspect
 import unittest
 from concurrent.futures import Future
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 from musicplayer.app import MusicPlayerApp
 from musicplayer.ui.audio_backend import FletAudioBackend
@@ -16,9 +16,10 @@ class FakePage:
         self.services: list[Any] = []
         self.scheduled: list[tuple[Any, tuple[Any, ...]]] = []
         self.futures: list[Future[Any]] = []
+        self.update_count = 0
 
     def update(self, *_: Any) -> None:
-        pass
+        self.update_count += 1
 
     def run_task(self, handler: Any, *args: Any) -> Future[Any]:
         self.scheduled.append((handler, args))
@@ -45,13 +46,8 @@ class FletAudioBackendTests(unittest.TestCase):
         backend.load(b"audio bytes")
         backend.play(1250)
 
-        # Service creation itself is marshalled to the page loop because a
-        # source may have become ready on a worker thread.
-        self.assertEqual(len(page.scheduled), 1)
-        mount_handler, mount_args = page.scheduled[0]
-        asyncio.run(mount_handler(*mount_args))
-        # Mounting schedules the load watchdog; play remains pending until the
-        # native client confirms that its player is ready.
+        # The long-lived service receives an async source-load RPC and a load
+        # watchdog; play remains pending until native preparation completes.
         self.assertEqual(len(page.scheduled), 2)
         backend._loaded_event(1)
         self.assertTrue(page.futures[1].cancelled())
@@ -68,6 +64,44 @@ class FletAudioBackendTests(unittest.TestCase):
         seek_operation = page.scheduled[5][1]
         self.assertEqual(play_operation[1], (1250,))
         self.assertEqual(seek_operation[1], (2500,))
+
+    def test_track_switch_keeps_services_mounted_and_avoids_page_update(self) -> None:
+        page = FakePage()
+        backend = FletAudioBackend(page)  # type: ignore[arg-type]  # ty: ignore[invalid-argument-type]
+        mounted_services = tuple(page.services)
+
+        backend.load(b"first")
+        backend._loaded_event(1)
+        backend.load(b"second")
+        backend.pause()
+
+        self.assertEqual(tuple(page.services), mounted_services)
+        self.assertEqual(len(page.services), 2)
+        self.assertEqual(page.update_count, 0)
+        self.assertIs(
+            page.scheduled[-1][0].__func__, FletAudioBackend._run_transport_operation
+        )
+
+    def test_obsolete_native_generation_events_are_rejected(self) -> None:
+        page = FakePage()
+        backend = FletAudioBackend(page)  # type: ignore[arg-type]  # ty: ignore[invalid-argument-type]
+        positions: list[int] = []
+        backend.bind(
+            on_position=positions.append,
+            on_duration=lambda _: None,
+            on_playing=lambda _: None,
+            on_completed=lambda: None,
+        )
+        backend.load("first.mp3")
+        backend.load("second.mp3")
+        assert backend.audio is not None
+        position_handler = backend.audio.on_position_change
+        assert position_handler is not None
+
+        cast(Any, position_handler)(SimpleNamespace(position=1_000, generation=1))
+        self.assertEqual(positions, [])
+        cast(Any, position_handler)(SimpleNamespace(position=2_000, generation=2))
+        self.assertEqual(positions, [2_000])
 
     def test_media_session_updates_are_throttled_to_five_seconds(self) -> None:
         page = FakePage()
@@ -146,6 +180,54 @@ class FletAudioBackendTests(unittest.TestCase):
 
         backend.sync_media_session(title="Track", playing=False)
         self.assertEqual(len(page.scheduled), 1)
+
+        backend.invalidate_media_session()
+        backend.sync_media_session(title="Track", playing=False)
+        self.assertEqual(len(page.scheduled), 2)
+        self.assertTrue(page.scheduled[-1][1][1]["reattach"])
+
+    def test_pause_keeps_media_session_metadata_until_explicit_stop(self) -> None:
+        class SessionBackend:
+            def __init__(self) -> None:
+                self.payloads: list[dict[str, object]] = []
+
+            def sync_media_session(self, **payload: object) -> None:
+                self.payloads.append(payload)
+
+        queue = SimpleNamespace(
+            items=["queued-track"],
+            peek_next=lambda **_: None,
+            repeat=SimpleNamespace(value="off"),
+            shuffle=False,
+        )
+        playback = SimpleNamespace(
+            external_title="Preview",
+            external_uploader="Artist",
+            external_thumbnail="",
+            current_track_id=None,
+            media_session_active=True,
+            duration_ms=10_000,
+            position_ms=2_000,
+            playing=False,
+            snapshot=SimpleNamespace(loading=False),
+            queue=queue,
+        )
+        app = object.__new__(MusicPlayerApp)
+        app.playback = playback  # type: ignore[assignment]  # ty: ignore[invalid-assignment]
+        session_backend = SessionBackend()
+        app.backend = session_backend  # type: ignore[assignment]  # ty: ignore[invalid-assignment]
+        app._system_media_key = None
+        app._system_media_metadata = ("", "", "", "")
+
+        app._sync_system_media()
+        self.assertEqual(session_backend.payloads[-1]["title"], "Preview")
+        self.assertFalse(session_backend.payloads[-1]["playing"])
+        self.assertTrue(session_backend.payloads[-1]["keep_alive"])
+
+        playback.media_session_active = False
+        app._sync_system_media(refresh_metadata=False)
+        self.assertEqual(session_backend.payloads[-1]["title"], "")
+        self.assertFalse(session_backend.payloads[-1]["keep_alive"])
 
     def test_refresh_state_publishes_native_position_and_duration(self) -> None:
         class NativeAudio:
@@ -233,6 +315,11 @@ class FletAudioBackendTests(unittest.TestCase):
                 self.position_ms = position_ms
                 self.calls.append(("seek", position_ms))
 
+            def stop(self) -> None:
+                self.playing = False
+                self.position_ms = 0
+                self.calls.append(("stop", None))
+
         playback = FakePlayback()
         app = object.__new__(MusicPlayerApp)
         app.playback = playback  # type: ignore[assignment]  # ty: ignore[invalid-assignment]
@@ -259,8 +346,7 @@ class FletAudioBackendTests(unittest.TestCase):
                 ("seek", 42_000),
                 ("seek", 32_000),
                 ("seek", 42_000),
-                ("toggle", None),
-                ("seek", 0),
+                ("stop", None),
             ],
         )
 

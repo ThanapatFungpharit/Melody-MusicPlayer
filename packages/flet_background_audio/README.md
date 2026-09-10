@@ -4,7 +4,7 @@ This package is owned by the Melody repository and ships with the application.
 Its Python controls and Dart implementation form one versioned protocol. It is
 not maintained as an independently compatible public Flet extension.
 
-The currently paired bridge version is 0.1.0 and the Flet family is pinned to
+The currently paired bridge version is 0.2.0 and the Flet family is pinned to
 0.86.5. Change both Python/Dart bridge versions together when the protocol changes;
 update Melody's dependency and validate the supported platform matrix in the
 same review. Local path resolution is intentional, not a second source of the

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
-import asyncio
 import logging
 import subprocess
 import sys
 from pathlib import Path
 
+from .core.runtime_gate import (
+    MEDIA_BINARY_PREPARATION,
+    configure_runtime_preparation,
+)
 from .platform_runtime import (
     MediaBinaryBundle,
     MediaBinaryError,
@@ -13,7 +16,6 @@ from .platform_runtime import (
     current_platform,
     media_binary_bundle,
 )
-from .yt_dlp_updater import prepare_yt_dlp
 
 logger = logging.getLogger(__name__)
 
@@ -135,10 +137,12 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    # Keep source-tree launches on the same import ordering contract as
-    # packaged launches.  The updater itself never imports yt-dlp.
-    asyncio.run(prepare_yt_dlp())
-    prepare_development_media_binaries()
+    # A source checkout may need to fetch its pinned media tools. Register the
+    # operation now; the first download starts it, while launch stays local.
+    configure_runtime_preparation(
+        prepare_development_media_binaries,
+        key=MEDIA_BINARY_PREPARATION,
+    )
 
     import flet as ft
 

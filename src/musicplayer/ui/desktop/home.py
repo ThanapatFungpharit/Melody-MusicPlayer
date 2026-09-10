@@ -173,7 +173,11 @@ def _track_card(app: MusicPlayerApp, track: Track) -> ft.Control:
             [
                 ft.Stack(
                     [
-                        _artwork(details.thumbnail, art_size),
+                        _artwork(
+                            details.thumbnail,
+                            art_size,
+                            cache=getattr(app, "thumbnails", None),
+                        ),
                         ft.Container(
                             ft.IconButton(
                                 ft.Icons.PLAY_ARROW_ROUNDED,

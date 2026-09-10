@@ -29,10 +29,13 @@ class BackgroundAudioSession(ft.Service):
         duration_ms: int = 0,
         position_ms: int = 0,
         playing: bool = False,
+        loading: bool = False,
         has_next: bool = True,
         has_previous: bool = True,
         repeat_mode: str = "off",
         shuffle: bool = False,
+        keep_alive: bool = False,
+        reattach: bool = False,
     ) -> None:
         """Activate the native session and publish one coherent player snapshot."""
         await self._invoke_method(
@@ -45,10 +48,13 @@ class BackgroundAudioSession(ft.Service):
                 "duration_ms": max(0, int(duration_ms)),
                 "position_ms": max(0, int(position_ms)),
                 "playing": bool(playing),
+                "loading": bool(loading),
                 "has_next": bool(has_next),
                 "has_previous": bool(has_previous),
                 "repeat_mode": repeat_mode,
                 "shuffle": bool(shuffle),
+                "keep_alive": bool(keep_alive),
+                "reattach": bool(reattach),
             },
         )
 

@@ -1,6 +1,6 @@
 [project]
 name = "flet-background-audio"
-version = "0.1.0"
+version = "0.2.0"
 description = "Melody's Flet bridge for background playback and system media controls"
 requires-python = ">=3.10"
 dependencies = [

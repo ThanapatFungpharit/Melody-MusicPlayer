@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import flet as ft
 
@@ -204,7 +204,14 @@ class NavigationTests(unittest.TestCase):
                 for row in playlist_view.controls
             )
         )
-        playlist_view.on_reorder(SimpleNamespace(old_index=0, new_index=2))
+        rendered_before = list(playlist_view.controls)
+        playlist_view.on_reorder(
+            SimpleNamespace(old_index=0, new_index=2, control=playlist_view)
+        )
+        self.assertEqual(
+            playlist_view.controls,
+            [rendered_before[1], rendered_before[0], rendered_before[2]],
+        )
         self.assertEqual(
             list(app.manager.get_playlist(playlist.id).track_ids),
             [before[1], before[0], before[2]],
@@ -243,6 +250,21 @@ class NavigationTests(unittest.TestCase):
         self.assertEqual(app.playback.current_track_id, original_ids[1])
         player.previous.on_click(None)
         self.assertEqual(app.playback.current_track_id, original_ids[0])
+
+    def test_collection_shuffle_reorders_visible_queue_once(self):
+        app = self.app()
+        tracks = app.manager.list_tracks()
+        ordered_ids = [str(track.id) for track in tracks]
+
+        with patch(
+            "musicplayer.application.queue.random.shuffle",
+            side_effect=lambda items: items.reverse(),
+        ):
+            app._play_collection(tracks, shuffle=True)
+
+        self.assertEqual(app.playback.queue.items, list(reversed(ordered_ids)))
+        self.assertEqual(app.playback.current_track_id, ordered_ids[-1])
+        self.assertTrue(app.playback.queue.shuffle)
 
     def test_progress_does_not_replace_screen_or_override_a_seek_drag(self):
         app = self.app()

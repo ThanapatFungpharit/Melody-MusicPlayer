@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     from musicplayer.application.playback import PlaybackController
     from musicplayer.application.providers import ProviderRegistry
     from musicplayer.application.store import ApplicationStore
+    from musicplayer.application.thumbnails import ThumbnailCache
     from musicplayer.core.concurrency import LazyBoundedExecutor
     from musicplayer.core.library import MusicManager
 
@@ -45,6 +46,7 @@ class AppProtocol(Protocol):
     playback: PlaybackController
     providers: ProviderRegistry
     downloads: DownloadCoordinator
+    thumbnails: ThumbnailCache
     workers: LazyBoundedExecutor
     tasks: Any
     file_picker: ft.FilePicker

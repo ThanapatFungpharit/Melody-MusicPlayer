@@ -87,7 +87,13 @@ class AppLayoutTests(unittest.TestCase):
             duration_ms=3000,
             position_ms=1000,
             playing=True,
-            queue=SimpleNamespace(repeat=SimpleNamespace(value="none"), shuffle=False),
+            media_session_active=True,
+            snapshot=SimpleNamespace(loading=False),
+            queue=SimpleNamespace(
+                repeat=SimpleNamespace(value="none"),
+                shuffle=False,
+                peek_next=lambda **_: "next",
+            ),
         )
         app.manager = Mock()
         app.manager.get_track.return_value = SimpleNamespace(
@@ -125,6 +131,7 @@ class AppLayoutTests(unittest.TestCase):
             )
         )
         app.backend.refresh_state.assert_not_called()
+        app.backend.invalidate_media_session.assert_not_called()
         app._sync_system_media.assert_not_called()
 
         app._app_lifecycle_changed(
@@ -135,6 +142,7 @@ class AppLayoutTests(unittest.TestCase):
         )
 
         app.backend.refresh_state.assert_called_once_with()
+        app.backend.invalidate_media_session.assert_called_once_with()
         app._sync_system_media.assert_called_once_with(refresh_metadata=False)
 
     def test_settings_uses_responsive_sections_and_fixed_footer(self) -> None:

@@ -9,9 +9,14 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   quality:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6
       - uses: astral-sh/setup-uv@v9.0.0
@@ -21,9 +26,12 @@ jobs:
       - run: uv run --locked --python 3.13 --group build ruff check src tests tools packages/flet_background_audio/src/flet_background_audio
       - run: uv run --locked --python 3.13 --group build ruff format --check src tests tools packages/flet_background_audio/src/flet_background_audio
       - run: uv run --locked --python 3.13 --group build ty check src tests tools
+
   tests:
     name: Tests (${{ matrix.os }}, Python ${{ matrix.python }})
+    needs: quality
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -41,11 +49,16 @@ jobs:
         run: uv run --locked --python ${{ matrix.python }} python -m unittest discover -s tests/integration -t . -v
       - name: UI tests (headless)
         run: uv run --locked --python ${{ matrix.python }} python -m unittest discover -s tests/ui -t . -v
+
   build-contracts:
     name: Packaging contracts and compiled UI smoke tests
+    needs: quality
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6
       - uses: astral-sh/setup-uv@v9.0.0
+        with:
+          enable-cache: true
       - run: uv sync --locked --python 3.13 --group build
       - run: uv run --locked --python 3.13 --group build python -m unittest discover -s tests/packaging -t . -v

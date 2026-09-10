@@ -11,6 +11,7 @@ class BackgroundAudioSessionService extends FletService {
 
   final FlutterMediaSession _session = FlutterMediaSession();
   bool _active = false;
+  bool _keepAlive = false;
   bool _disposed = false;
 
   @override
@@ -82,7 +83,6 @@ class BackgroundAudioSessionService extends FletService {
     // shim's focus handler as well would make the two native focus requests
     // interrupt one another.
     await _session.setAutoHandleInterruptions(false);
-    await _session.setBackgroundKeepAlive(false);
     _active = true;
   }
 
@@ -103,7 +103,19 @@ class BackgroundAudioSessionService extends FletService {
     if (_disposed) {
       return;
     }
+    final reattach = data["reattach"] as bool? ?? false;
+    if (reattach) {
+      // activate() is idempotent when Android's MediaSessionService survived
+      // an activity detach. Re-running the attachment also repairs action
+      // handlers if the platform service was recreated while the page slept.
+      _active = false;
+    }
     await _ensureActive();
+    final keepAlive = data["keep_alive"] as bool? ?? false;
+    if (_keepAlive != keepAlive || reattach) {
+      await _session.setBackgroundKeepAlive(keepAlive);
+      _keepAlive = keepAlive;
+    }
     final title = (data["title"] as String?)?.trim() ?? "";
     final artist = (data["artist"] as String?)?.trim();
     final album = (data["album"] as String?)?.trim();
@@ -111,6 +123,7 @@ class BackgroundAudioSessionService extends FletService {
     final durationMs = (data["duration_ms"] as num?)?.toInt() ?? 0;
     final positionMs = (data["position_ms"] as num?)?.toInt() ?? 0;
     final playing = data["playing"] as bool? ?? false;
+    final loading = data["loading"] as bool? ?? false;
 
     await FlutterMediaSessionPlatform.instance.updateMetadata(
       MediaMetadata(
@@ -125,8 +138,7 @@ class BackgroundAudioSessionService extends FletService {
     );
 
     final actions = <MediaAction>{
-      MediaAction.play,
-      MediaAction.pause,
+      if (playing) MediaAction.pause else MediaAction.play,
       MediaAction.stop,
       MediaAction.seekTo,
       MediaAction.rewind,
@@ -143,9 +155,13 @@ class BackgroundAudioSessionService extends FletService {
     };
     await FlutterMediaSessionPlatform.instance.updatePlaybackState(
       PlaybackState(
-        status: playing ? PlaybackStatus.playing : PlaybackStatus.paused,
+        status: loading
+            ? PlaybackStatus.buffering
+            : playing
+                ? PlaybackStatus.playing
+                : PlaybackStatus.paused,
         position: Duration(milliseconds: positionMs),
-        speed: playing ? 1.0 : 0.0,
+        speed: playing && !loading ? 1.0 : 0.0,
         repeatMode: repeatMode,
         shuffleModeEnabled: data["shuffle"] as bool? ?? false,
       ),
@@ -166,6 +182,10 @@ class BackgroundAudioSessionService extends FletService {
     if (!_active) {
       return;
     }
+    if (_keepAlive) {
+      await _session.setBackgroundKeepAlive(false);
+      _keepAlive = false;
+    }
     _active = false;
     await _session.deactivate();
   }
@@ -175,6 +195,10 @@ class BackgroundAudioSessionService extends FletService {
     _disposed = true;
     control.removeInvokeMethodListener(_invokeMethod);
     _session.clearActionHandler();
+    if (_keepAlive) {
+      _keepAlive = false;
+      unawaited(_session.setBackgroundKeepAlive(false).catchError((Object _) {}));
+    }
     unawaited(_session.deactivate().catchError((Object _) {}));
     super.dispose();
   }

@@ -280,7 +280,12 @@ def _download_row(app: MusicPlayerApp, record: DownloadRecord) -> ft.Control:
     header: ft.Control
     header = ft.Row(
         [
-            _artwork(record.thumbnail, 56, playlist=record.kind == "playlist"),
+            _artwork(
+                record.thumbnail,
+                56,
+                playlist=record.kind == "playlist",
+                cache=getattr(app, "thumbnails", None),
+            ),
             detail_column,
             ft.Column(
                 [status_chip, ft.Row(actions, spacing=4)],

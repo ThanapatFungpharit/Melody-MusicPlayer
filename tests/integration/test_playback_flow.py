@@ -116,6 +116,7 @@ class CleanDownloadPlaybackFlowTests(unittest.TestCase):
                     self.assertEqual(audio.getnframes(), 2_000)
                 self.assertEqual(backend.played_at, [0])
                 self.assertEqual(playback.current_track_id, track_id)
+                playback.on_loaded()
                 playback.on_playing(True)
                 self.assertEqual(store.track_details(track_id).play_count, 1)
             finally:

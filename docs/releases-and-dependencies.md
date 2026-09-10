@@ -31,15 +31,16 @@ them throughout the TOML file.
 | Component | Tested baseline in this checkout |
 | --- | --- |
 | Flet / Flet Audio / Flet Desktop / Flet CLI | 0.86.5, exact Python pins |
-| Local flet-background-audio Python/Dart package | 0.1.0 |
+| Local flet-background-audio Python/Dart package | 0.2.0 |
 | Bridge Dart Flet | 0.86.5, exact |
-| Bridge audioplayers / flutter_media_session | 6.6.0 / 3.0.1, exact |
+| Bridge audioplayers / flutter_media_session | 6.6.0 / 3.0.3, exact |
 | Bundled yt-dlp fallback | 2026.8.19, exact |
+| Mutagen media-tag support | 1.48.1, exact |
 
 The background-audio package is owned and maintained in this repository. It is
 an application dependency resolved from `packages/flet_background_audio` through
 `tool.uv.sources` and Flet's dev-package mapping. It is not an independently
-supported public distribution. Its `0.1.0` version describes the Python/Dart
+supported public distribution. Its `0.2.0` version describes the Python/Dart
 bridge protocol, not Melody's application version; keep both package manifests
 in agreement when the bridge protocol changes. The Dart package is marked
 `publish_to: none`.
@@ -67,10 +68,15 @@ is a bounded compatibility policy, not a claim that all upstream behaviors in
 that range have been tested. Changing the window requires a reviewed Melody
 change and extractor/download regression tests.
 
-Selection finishes before any provider/worker imports yt-dlp. The async startup
-entry point prepares once per process, returns one `UpdateResult`, and holds a
-session lock for the process lifetime. A second process unable to acquire the
-runtime session lock uses its bundled package without changing that cache.
+Normal application launch selects the immutable bundled pin and does not run the
+runtime updater. This removes PyPI metadata reads, wheel downloads, wheel hashing,
+subprocess import probes, runtime locks, and updater-state fsyncs from startup.
+Provider imports remain lazy at the first YouTube feature. Source-checkout
+media-tool preparation is registered without starting and joined only by the
+first download, so local playback remains offline-first. When the explicit
+updater facility is invoked, it holds a session lock for the process lifetime. A
+second process unable to acquire that lock uses its bundled package without
+changing the cache.
 Changing a selected runtime requires a restart; hot-swapping imported modules
 is forbidden. Diagnostics should report `UpdateResult.active_version` and
 `active_source`, with the bundled/current/previous versions as context.

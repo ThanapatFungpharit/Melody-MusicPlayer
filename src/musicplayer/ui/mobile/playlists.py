@@ -71,6 +71,7 @@ def _playlist_card(app, playlist) -> ft.Control:
             f"Play {playlist.name}",
             lambda _: app._play_playlist(playlist),
         ),
+        cache=getattr(app, "thumbnails", None),
     )
 
 
@@ -203,4 +204,5 @@ def _playlist_track_row(
         details.thumbnail,
         lambda _: app.playback.play_tracks(playlist_track_ids, start_index=index),
         more(app, _track_title(track), menu),
+        cache=getattr(app, "thumbnails", None),
     )
